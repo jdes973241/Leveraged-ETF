@@ -14,7 +14,7 @@ import warnings
 st.set_page_config(page_title="Dynamic Momentum Strategy", layout="wide")
 warnings.simplefilter(action='ignore')
 
-# CSS 美化
+# CSS 美化 (含修正後的 metric 卡片樣式)
 st.markdown("""
 <style>
     /* 修正 metric card，強制深色文字以適配淺底色 */
@@ -24,16 +24,18 @@ st.markdown("""
         border-radius: 8px; 
         border: 1px solid #d1d5db;
         text-align: center;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
     }
     .metric-label {
         font-size: 14px; 
         color: #555555; 
         margin-bottom: 0;
+        font-weight: 500;
     }
     .metric-value {
         font-size: 24px; 
         font-weight: bold; 
-        color: #000000;
+        color: #000000 !important; /* 強制黑色 */
         margin: 5px 0;
     }
     .metric-sub {
@@ -56,7 +58,7 @@ RISK_CONFIG = {
     "EURL": {"exit_q": 0.97, "entry_q": 0.82},
     "EDC":  {"exit_q": 0.70, "entry_q": 0.55}
 }
-ROLLING_WINDOW_SIZE = 1260
+ROLLING_WINDOW_SIZE = 1260 # GARCH 訓練視窗 (約5年)
 SMA_WINDOW = 200
 MOM_PERIODS = [3, 6, 9, 12]
 TRANSACTION_COST = 0.001 # 0.1%
@@ -345,8 +347,20 @@ with tab6:
 # ==========================================
 st.markdown("---")
 st.header("⏳ 歷史回測分析 (Backtest)")
-st.caption("回測設定：2010 ~ 至今 | 交易成本 0.1% | 避險: 輪動持有 GLD/TLT")
-st.markdown("**基準 (Benchmark)**: UPRO + EURL + EDC (每季等權重再平衡)")
+
+# 估算回測起始日
+if not data.empty:
+    est_start_date = data.index[0] + timedelta(days=ROLLING_WINDOW_SIZE * 1.45) 
+    start_date_str = est_start_date.strftime('%Y-%m-%d')
+else:
+    start_date_str = "N/A"
+
+st.caption(f"""
+設定說明：
+- **回測起點**：約 {start_date_str} (扣除 {ROLLING_WINDOW_SIZE} 天 GARCH 暖機期)
+- **交易成本**：{TRANSACTION_COST:.1%} | **避險**：GLD/TLT 輪動
+- **基準 (Benchmark)**：UPRO + EURL + EDC (每季等權重再平衡)
+""")
 
 if st.button("🚀 開始執行回測"):
     
@@ -355,6 +369,7 @@ if st.button("🚀 開始執行回測"):
         monthly_prices = data[list(MAPPING.keys())].resample('M').last()
         hist_winners = pd.Series(index=monthly_prices.index, dtype='object')
         
+        # 向量化計算動能
         mom_score = pd.DataFrame(0.0, index=monthly_prices.index, columns=monthly_prices.columns)
         for m in MOM_PERIODS:
             mom_score += monthly_prices.pct_change(m)
@@ -368,7 +383,12 @@ if st.button("🚀 開始執行回測"):
         
         # 3. 逐日回測迴圈
         dates = data.index
-        start_idx = 252 
+        # [關鍵修正] 跳過 GARCH 暖機期
+        start_idx = ROLLING_WINDOW_SIZE 
+        
+        if start_idx >= len(dates):
+            st.error("數據長度不足以進行回測。")
+            st.stop()
         
         strategy_ret = []
         valid_dates = []
@@ -391,6 +411,7 @@ if st.button("🚀 開始執行回測"):
             # Weight Logic
             if target_risky in risk_data and today in risk_data[target_risky].index:
                 w_risk = risk_data[target_risky].loc[today, 'Weight']
+                if pd.isna(w_risk): w_risk = 0.0
             else:
                 w_risk = 0.0 
             w_safe = 1.0 - w_risk
@@ -436,32 +457,26 @@ if st.button("🚀 開始執行回測"):
         cum_eq = (1 + eq).cumprod()
         dd = cum_eq / cum_eq.cummax() - 1
         
-        # Benchmark: UPRO+EURL+EDC Equal Weight Quarterly Rebalance
+        # [Benchmark 修正] Quarterly Rebalance (Equal Weight)
         bench_subset = data[list(MAPPING.keys())].loc[valid_dates].copy()
-        
-        # 構建季末再平衡權益曲線
         b_equity_series = pd.Series(1.0, index=bench_subset.index)
         current_capital = 1.0
         
-        # 找出季末節點 (包含起始日與結束日)
-        # 使用 groupby 來確保找出每個 Quarter 最後一個"交易日"
+        # 找出季末日期
         quarter_ends = bench_subset.groupby(pd.Grouper(freq='QE')).apply(lambda x: x.index[-1] if len(x)>0 else None).dropna()
         check_points = sorted(list(set([bench_subset.index[0]] + list(quarter_ends) + [bench_subset.index[-1]])))
         
         for i in range(len(check_points)-1):
             t_start = check_points[i]
             t_end = check_points[i+1]
-            
-            # 取出區間 (避免空區間)
             if t_start >= t_end: continue
             
-            # loc 是包含邊界的，但為了計算正確回報，我們需要 t_start 的價格作為基期
+            # 區間計算 (以區間起點為基期歸一化)
             segment = bench_subset.loc[t_start:t_end]
             if len(segment) < 2: continue
             
-            # 歸一化：以該段起點為基數 1.0
-            # 假設起點再平衡，權重重置為 1/3
             rel_price = segment.div(segment.iloc[0])
+            # 等權重持有
             segment_val = rel_price.mean(axis=1) * current_capital
             
             b_equity_series.loc[t_start:t_end] = segment_val
@@ -471,7 +486,7 @@ if st.button("🚀 開始執行回測"):
         bench_ret = bench_eq.pct_change().fillna(0)
         bench_dd = bench_eq / bench_eq.cummax() - 1
         
-        # Metrics Calculation Helper
+        # Metrics Helper
         def calc_stats(equity, daily_r):
             if len(equity) < 1: return 0,0,0,0,0
             d = (equity.index[-1] - equity.index[0]).days
@@ -487,17 +502,16 @@ if st.button("🚀 開始執行回測"):
         s_cagr, s_sort, s_roll, s_mdd = calc_stats(cum_eq, eq)
         b_cagr, b_sort, b_roll, b_mdd = calc_stats(bench_eq, bench_ret)
         
-        # Time in Market (3x Assets)
+        # Time in Market
         total_d = len(valid_dates)
         time_in_mkt = (hold_counts['UPRO'] + hold_counts['EURL'] + hold_counts['EDC']) / total_d
         
-        # Alloc String
         alloc_str = ""
         for k, v in hold_counts.items():
             pct = v / total_d
             if pct > 0.01: alloc_str += f"{k}:{pct:.0%} "
             
-        # --- C. 顯示結果 (Metric Box with CSS) ---
+        # --- C. 顯示結果 ---
         st.write("### 📈 回測績效指標")
         m1, m2, m3, m4, m5 = st.columns(5)
         
@@ -519,7 +533,7 @@ if st.button("🚀 開始執行回測"):
         
         st.markdown(f"**資產分佈 (時間加權):** {alloc_str}")
         
-        # 2. Altair 圖表 (含 Benchmark)
+        # Charts
         st.write("### 📊 權益曲線與回撤")
         
         df_chart = pd.DataFrame({
@@ -537,7 +551,6 @@ if st.button("🚀 開始執行回測"):
         
         st.altair_chart(chart, use_container_width=True)
         
-        # Drawdown Chart
         df_dd_chart = pd.DataFrame({
             'Date': cum_eq.index,
             'Strategy': dd,
