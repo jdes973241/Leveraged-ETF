@@ -11,7 +11,7 @@ import warnings
 # ==========================================
 # 0. 頁面設定與參數
 # ==========================================
-st.set_page_config(page_title="Dynamic Momentum Strategy (Q80 Fixed)", layout="wide")
+st.set_page_config(page_title="Dynamic Momentum Strategy (Final Corrected)", layout="wide")
 warnings.simplefilter(action='ignore')
 
 # CSS 美化
@@ -37,15 +37,14 @@ st.markdown("""
 MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"} 
 SAFE_POOL = ["GLD", "TLT"] 
 
-# [修正] 參數改為 Q80 / Q65
+# [參數確認] 統一 Q80 / Q65
 RISK_CONFIG = {
     "UPRO": {"exit_q": 0.80, "entry_q": 0.65},
     "EURL": {"exit_q": 0.80, "entry_q": 0.65},
     "EDC":  {"exit_q": 0.80, "entry_q": 0.65}
 }
 
-ROLLING_WINDOW_SIZE = 1260 # Live 模式用長窗口
-BACKTEST_GARCH_WINDOW = 504 # 回測模式用短窗口以最大化長度
+ROLLING_WINDOW_SIZE = 1260 
 SMA_WINDOW = 200
 MOM_PERIODS = [3, 6, 9, 12]
 TRANSACTION_COST = 0.001 
@@ -102,8 +101,7 @@ def calculate_risk_metrics(data):
             df = df.dropna()
 
             cfg = RISK_CONFIG[trade_t]
-            
-            # [嚴格執行] Dashboard 顯示當日數值，Shift 1 代表這是"昨天收盤"算出的閾值，適用於"今天"
+            # Dashboard 顯示用 (Shift 1 表示昨收數值應用於今日)
             df['Exit_Th'] = df['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
             df['Entry_Th'] = df['Vol'].rolling(252).quantile(cfg['entry_q']).shift(1)
             
@@ -160,7 +158,7 @@ def calculate_selection_metrics(data):
 def get_safe_asset_status(data):
     if data.empty: return "TLT", {}
     
-    # Live 模式：顯示當前最新狀態
+    # 比較上個月底的績效 (符合回測邏輯)
     monthly = data[SAFE_POOL].resample('M').last()
     if len(monthly) > 12:
         p_now = monthly.iloc[-1]
@@ -176,7 +174,7 @@ def get_safe_asset_status(data):
     return winner, details
 
 # ==========================================
-# 2. 回測專用邏輯
+# 2. 回測專用邏輯 (合成數據 + 長回測)
 # ==========================================
 
 @st.cache_data(ttl=3600, show_spinner="生成長歷史合成數據中 (2005~)...")
@@ -188,6 +186,7 @@ def get_synthetic_backtest_data():
             if 'Close' in data_raw.columns.levels[0]: data_raw = data_raw['Close']
             else: data_raw = data_raw['Close'] if 'Close' in data_raw else data_raw
         
+        # 確保 VGK/EEM 數據存在
         data_raw = data_raw.ffill().dropna(subset=['VGK', 'EEM', 'SPY', 'GLD', 'TLT'])
         
         synthetic_data = pd.DataFrame(index=data_raw.index)
@@ -207,6 +206,50 @@ def get_synthetic_backtest_data():
         return synthetic_data
     except Exception as e:
         return pd.DataFrame()
+
+# [關鍵修正]：正確實作 Risk-Adjusted Z-Score 回測選股
+def calculate_historical_winners(syn_data):
+    """回測專用的歷史動能計算 (嚴格遵守白皮書邏輯)"""
+    tickers = list(MAPPING.keys())
+    monthly_prices = syn_data[tickers].resample('M').last()
+    
+    winners = pd.Series(index=monthly_prices.index, dtype='object')
+    
+    # 為了計算 Z-Score，我們需要每個月進行一次橫向比較
+    # 雖然比向量化慢一點，但邏輯才是正確的
+    
+    for i in range(13, len(monthly_prices)):
+        curr_date = monthly_prices.index[i]
+        
+        scores = pd.DataFrame(index=tickers, columns=MOM_PERIODS)
+        
+        # 取得該日期的日波動率 (過去半年 126天)
+        d_loc = syn_data.index.get_indexer([curr_date], method='pad')[0]
+        # 防呆
+        if d_loc < 126: continue
+        
+        daily_subset = syn_data[tickers].iloc[d_loc-126 : d_loc]
+        vol = daily_subset.pct_change().std() * np.sqrt(252) # 年化波動
+        
+        for m in MOM_PERIODS:
+            prev_date = monthly_prices.index[i-m]
+            # 區間回報
+            ret = (monthly_prices.loc[curr_date] - monthly_prices.loc[prev_date]) / monthly_prices.loc[prev_date]
+            
+            # Risk Adjusted
+            risk_adj = ret / (vol + 1e-6)
+            scores[m] = risk_adj
+            
+        # Z-Score 標準化 (橫向: 對三個標的做標準化)
+        # Apply zscore per column (period) is WRONG -> Should be per period across assets?
+        # 白皮書：將三個標的在"同一週期"內的分數 Z-Score
+        z_scores = scores.apply(lambda x: (x - x.mean()) / (x.std() + 1e-6), axis=0)
+        
+        # 加總
+        final_score = z_scores.sum(axis=1)
+        winners[curr_date] = final_score.idxmax()
+        
+    return winners.dropna()
 
 # ==========================================
 # 3. 應用程式主邏輯
@@ -243,19 +286,17 @@ st.caption(f"數據基準日: {latest_date.strftime('%Y-%m-%d')}")
 # 白皮書區塊
 with st.expander("📖 策略白皮書 (Strategy Whitepaper)", expanded=False):
     st.markdown("""
-    ### 策略邏輯摘要 (Updated Q80)
+    ### 策略邏輯摘要
     本策略採用 **訊號與執行分離 (Decoupled Signal)** 架構，利用 1x 原型預測風險，操作 3x 槓桿獲利。
     
     #### 1. 選股引擎 (Selection Engine)
     * **對象**: UPRO, EURL, EDC (3x 槓桿)。
-    * **邏輯**: 計算 3M, 6M, 9M, 12M 的 **風險調整後報酬**，並進行 **Z-Score** 排序。
+    * **邏輯**: 計算 3M, 6M, 9M, 12M 的 **風險調整後報酬 (Return/Vol)**，並進行 **Z-Score** 排序。
     * **決策**: 選出總分最高的標的作為本月 Winner。
     
     #### 2. 風控引擎 (Risk Engine)
     * **對象**: SPY, VGK, EEM (1x 原型)。
-    * **A 軌 (GARCH)**: 每日滾動預測波動率。
-        * **賣出**: 波動率 > 過去一年 Q80
-        * **買回**: 波動率 < 過去一年 Q65
+    * **A 軌 (GARCH)**: 每日滾動預測波動率。若 `Vol > Exit(Q80)` 避險；若 `Vol < Entry(Q65)` 持有。
     * **B 軌 (SMA)**: 若價格 > 200MA 持有；否則避險。
     * **權重**: 0.5 * GARCH + 0.5 * SMA。
     
@@ -338,24 +379,23 @@ with tab6:
 st.markdown("---")
 st.header("⏳ 歷史回測分析 (Synthetic)")
 
+# 使用合成數據進行長回測
 syn_data = get_synthetic_backtest_data()
 
 if syn_data.empty:
     st.warning("合成數據生成失敗。")
 else:
-    # 暖機期：GARCH(504) + Mom(252) + QuantileBuffer(252)
-    # 實際上 GARCH 504 就可以開始產生 Vol，但要累積 Quantile 還要 252
-    # 總共約需 756 天
-    BACKTEST_START_IDX = BACKTEST_GARCH_WINDOW + 252 
-    est_start_date = syn_data.index[0] + timedelta(days=BACKTEST_START_IDX * 1.45) 
+    BACKTEST_GARCH_WINDOW = 504 
+    est_start_date = syn_data.index[0] + timedelta(days=(BACKTEST_GARCH_WINDOW + 252) * 1.45) 
     start_date_str = est_start_date.strftime('%Y-%m-%d')
 
     st.caption(f"""
-    **回測設定說明 (Q80版)：**
-    1.  **數據源**：使用 1x 原型合成 3x 數據 (含動態損耗)。
+    **回測設定說明 (白皮書修正版)：**
+    1.  **數據源**：合成 3x 數據 (含動態損耗)。
     2.  **回測起點**：約 {start_date_str} (確保覆蓋 2008)。
-    3.  **交易成本**：0.1% | **暖機期**：約 3 年。
-    4.  **基準 (Benchmark)**：UPRO + EURL + EDC (每季等權重)。
+    3.  **交易成本**：0.1% | **GARCH 暖機**：2 年。
+    4.  **選股邏輯**：**Risk-Adjusted Z-Score** (非原始回報)。
+    5.  **基準 (Benchmark)**：UPRO + EURL + EDC (每季等權重)。
     """)
 
     if st.button("🚀 開始執行回測 (Synthetic)"):
@@ -370,7 +410,6 @@ else:
                 r = s.pct_change() * 100
                 sma = s.rolling(SMA_WINDOW).mean()
                 
-                # 回測使用全區間 fit 近似，但 Signal 使用 Shift 1 (嚴謹)
                 win = r.dropna()
                 am = arch_model(win, vol='Garch', p=1, q=1, dist='t', rescale=False)
                 res = am.fit(disp='off', show_warning=False)
@@ -379,7 +418,6 @@ else:
                 df = pd.DataFrame({'Vol': vol, 'Price': s, 'SMA': sma})
                 cfg = RISK_CONFIG[ticker_3x]
                 
-                # [關鍵] Shift 1 避免未來視角
                 roll_ex = df['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
                 roll_en = df['Vol'].rolling(252).quantile(cfg['entry_q']).shift(1)
                 
@@ -394,21 +432,17 @@ else:
                 
             h_risk_weights = h_risk_weights.dropna()
             
-            # 2. 歷史動能 (Selection) - 月頻
-            monthly_prices = syn_data[list(MAPPING.keys())].resample('M').last()
-            mom_score = pd.DataFrame(0.0, index=monthly_prices.index, columns=monthly_prices.columns)
-            for m in MOM_PERIODS: mom_score += monthly_prices.pct_change(m)
-            hist_winners = mom_score.idxmax(axis=1)
+            # 2. 歷史動能 (Selection) - [修正] 改用 Z-Score Logic
+            hist_winners = calculate_historical_winners(syn_data)
             
-            # 3. 歷史避險 (Rotation) - [修正] 改為月頻，月初比較上個月底
+            # 3. 歷史避險 (Rotation) - 月頻
             safe_monthly = syn_data[SAFE_POOL].resample('M').last()
             safe_mom = safe_monthly.pct_change(12) 
             hist_safe = safe_mom.idxmax(axis=1).fillna('TLT')
             
             # 4. 逐日回測
             dates = syn_data.index
-            # 確保指標都有值
-            start_idx = BACKTEST_START_IDX 
+            start_idx = BACKTEST_GARCH_WINDOW + 252 
             
             strategy_ret = []
             valid_dates = []
@@ -420,23 +454,19 @@ else:
             for i in range(start_idx, len(dates)):
                 if i % 100 == 0: progress.progress((i - start_idx) / (len(dates)-start_idx))
                 today = dates[i]
+                yesterday = dates[i-1] # Strict Lag
                 
-                # 取得"昨天" (T-1)
-                yesterday = dates[i-1]
-                
-                # [關鍵修正] 使用昨日資訊
-                
-                # A. 決定進攻標的 (取yesterday以前最近的月底)
+                # A. 決定進攻標的
                 past_wins = hist_winners[hist_winners.index <= yesterday]
                 if past_wins.empty: continue
                 target_risky = past_wins.iloc[-1]
                 
-                # B. 決定避險標的 (取yesterday以前最近的月底)
+                # B. 決定避險標的
                 past_safe = hist_safe[hist_safe.index <= yesterday]
                 if past_safe.empty: target_safe = 'TLT'
                 else: target_safe = past_safe.iloc[-1]
                 
-                # C. 決定權重 (昨日收盤確認)
+                # C. 決定權重
                 if target_risky in h_risk_weights.columns and yesterday in h_risk_weights.index:
                     w_risk = h_risk_weights.loc[yesterday, target_risky]
                     if pd.isna(w_risk): w_risk = 0.0
@@ -457,7 +487,7 @@ else:
                     if w_prev != w_curr:
                         cost += abs(w_curr - w_prev) * TRANSACTION_COST
                 
-                # F. 計算損益 (今日)
+                # F. 計算損益
                 day_ret = 0.0
                 if w_risk > 0:
                     r = syn_data[target_risky].pct_change().iloc[i]
@@ -470,7 +500,6 @@ else:
                     
                 strategy_ret.append(day_ret - cost)
                 valid_dates.append(today)
-                
                 hold_counts[target_risky] += w_risk
                 hold_counts[target_safe] += w_safe
                 prev_pos = curr_pos
@@ -524,7 +553,7 @@ else:
 
             s_cagr, s_sort, s_roll, s_mdd = calc_stats(cum_eq, eq)
             b3_cagr, b3_sort, b3_roll, b3_mdd = calc_stats(bench_eq, bench_eq.pct_change().fillna(0))
-            vt_cagr, vt_sort, vt_roll, vt_mdd = calc_stats(vt_eq, vt_eq.pct_change().fillna(0))
+            v_cagr, v_sort, v_roll, v_mdd = calc_stats(vt_eq, vt_eq.pct_change().fillna(0))
             
             total_d = len(valid_dates)
             time_in_mkt = (hold_counts['UPRO'] + hold_counts['EURL'] + hold_counts['EDC']) / total_d
@@ -546,10 +575,10 @@ else:
                 </div>
                 """, unsafe_allow_html=True)
 
-            with m1: metric_box("CAGR", s_cagr, b3_cagr, vt_cagr)
-            with m2: metric_box("Sortino", s_sort, b3_sort, vt_sort, "{:.2f}")
-            with m3: metric_box("Avg 5Y Roll", s_roll, b3_roll, vt_roll)
-            with m4: metric_box("Max DD", s_mdd, b3_mdd, vt_mdd)
+            with m1: metric_box("CAGR", s_cagr, b3_cagr, v_cagr)
+            with m2: metric_box("Sortino", s_sort, b3_sort, v_sort, "{:.2f}")
+            with m3: metric_box("Avg 5Y Roll", s_roll, b3_roll, v_roll)
+            with m4: metric_box("Max DD", s_mdd, b3_mdd, v_mdd)
             with m5: metric_box("Time in 3x", time_in_mkt, None, None) 
             
             st.markdown(f"**平均資產分佈:** {alloc_str}")
@@ -557,7 +586,6 @@ else:
             # Charts
             st.write("### 📊 權益曲線與回撤")
             
-            # Equity
             df_chart = pd.DataFrame({
                 'Date': cum_eq.index,
                 'Strategy': cum_eq,
@@ -573,7 +601,6 @@ else:
             ).properties(height=350, title="權益曲線 (Log Scale)").interactive()
             st.altair_chart(chart, use_container_width=True)
             
-            # Drawdown
             df_dd = pd.DataFrame({
                 'Date': cum_eq.index,
                 'Strategy': dd,
@@ -587,7 +614,6 @@ else:
             ).properties(height=200, title="回撤幅度").interactive()
             st.altair_chart(chart_dd, use_container_width=True)
             
-            # Rolling 5Y
             roll5_s = cum_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260) - 1)
             roll5_b = bench_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260) - 1)
             roll5_v = vt_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260) - 1)
