@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import altair as alt
 from arch import arch_model
+from collections import defaultdict
 from datetime import datetime, timedelta
 import warnings
 
@@ -45,7 +46,6 @@ RF_RATE = 0.04 # 無風險利率
 def get_market_data():
     """下載所有相關標的數據 (含避險資產)"""
     tickers = list(MAPPING.keys()) + list(MAPPING.values()) + SAFE_POOL
-    # 下載較長歷史以供回測
     try:
         data = yf.download(tickers, period="max", interval="1d", auto_adjust=True, progress=False)
         if isinstance(data.columns, pd.MultiIndex):
@@ -115,7 +115,6 @@ def calculate_selection_metrics(data):
     
     metrics = []
     # 只計算最新一天的狀態供 Dashboard 使用
-    # 回測時會另外計算歷史序列
     latest_date = prices.index[-1]
     
     for ticker in prices.columns:
@@ -156,12 +155,29 @@ def calculate_selection_metrics(data):
 @st.cache_data(ttl=3600)
 def get_safe_asset_status(data):
     """計算當前避險資產 (GLD vs TLT)"""
-    if data.empty: return "TLT"
+    if data.empty: return "TLT", {}
+    
     # 計算過去 12 個月 (252天) 報酬
-    subset = data[SAFE_POOL].tail(253)
-    ret_12m = (subset.iloc[-1] / subset.iloc[0]) - 1
+    # 取最新數據
+    p_now = data[SAFE_POOL].iloc[-1]
+    # 確保有足夠歷史
+    if len(data) > 252:
+        p_prev = data[SAFE_POOL].iloc[-253]
+        ret_12m = (p_now / p_prev) - 1
+    else:
+        ret_12m = pd.Series(0.0, index=SAFE_POOL)
+        
     winner = ret_12m.idxmax()
-    return winner, ret_12m
+    
+    # 回傳詳細資訊供表格顯示
+    details = pd.DataFrame({
+        "Ticker": SAFE_POOL,
+        "Current Price": p_now.values,
+        "12M Ago Price": p_prev.values if len(data) > 252 else [np.nan]*2,
+        "12M Return": ret_12m.values
+    }).set_index("Ticker")
+    
+    return winner, details
 
 # ==========================================
 # 2. 應用程式主邏輯
@@ -175,7 +191,7 @@ if data.empty:
 
 risk_data = calculate_risk_metrics(data)
 selection_df = calculate_selection_metrics(data)
-safe_winner, safe_rets = get_safe_asset_status(data)
+safe_winner, safe_details_df = get_safe_asset_status(data)
 
 # 取得最新狀態
 latest_date = data.index[-1]
@@ -220,15 +236,16 @@ with c3:
               delta="✅" if g_state == 1.0 else "🔻")
 
 with c4:
+    safe_ret = safe_details_df.loc[safe_winner, '12M Return']
     st.metric("🛡️ 當前最佳避險", safe_winner, 
-              f"12M Ret: {safe_rets[safe_winner]:.1%}")
+              f"12M Ret: {safe_ret:.1%}")
 
 st.divider()
 
 # --- 透視表格 ---
 st.subheader("📊 策略透視 (Strategy Whitebox)")
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "1️⃣ 數據層", "2️⃣ 風控層", "3️⃣ 權重層", "4️⃣ 選股層", "5️⃣ 執行層"
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "1️⃣ 數據層", "2️⃣ 風控層", "3️⃣ 權重層", "4️⃣ 選股層", "5️⃣ 避險資產層", "6️⃣ 執行層"
 ])
 
 with tab1:
@@ -265,7 +282,25 @@ with tab4:
     st.caption("動能排名 (Risk-Adjusted Z-Score)")
     st.dataframe(selection_df.style.format("{:.2f}"), use_container_width=True)
 
+# [新增] 避險資產層
 with tab5:
+    st.caption("避險資產輪動 (Safe Asset Rotation)")
+    st.info("規則：若需要避險 (權重 < 1.0)，則比較 GLD 與 TLT 過去 12 個月的報酬，持有較強者。")
+    
+    # 標記贏家
+    safe_display = safe_details_df.copy()
+    safe_display['Selected'] = safe_display.index.map(lambda x: '✅' if x == safe_winner else '')
+    
+    st.dataframe(
+        safe_display.style.format({
+            "Current Price": "{:.2f}",
+            "12M Ago Price": "{:.2f}",
+            "12M Return": "{:.2%}"
+        }).map(lambda x: 'color: green' if x == '✅' else '', subset=['Selected']),
+        use_container_width=True
+    )
+
+with tab6:
     st.markdown("#### 🚀 最終執行指令")
     
     # 邏輯判斷
@@ -283,7 +318,7 @@ with tab5:
     **決策邏輯：**
     1. 進攻標的 **{winner_ticker}** 的風控權重為 {final_weight}。
     2. 剩餘 {safe_weight} 權重配置於避險資產。
-    3. 比較 GLD ({safe_rets['GLD']:.1%}) 與 TLT ({safe_rets['TLT']:.1%}) 過去 12 個月績效。
+    3. 比較 GLD ({safe_details_df.loc['GLD', '12M Return']:.1%}) 與 TLT ({safe_details_df.loc['TLT', '12M Return']:.1%})。
     4. 選擇 **{safe_winner}** 作為避險部位。
     """)
 
@@ -296,45 +331,35 @@ st.caption("回測設定：2010 ~ 至今 | 交易成本 0.1% | 避險: 輪動持
 
 if st.button("🚀 開始執行回測"):
     
-    # --- A. 準備回測數據 ---
-    # 為了速度，我們重用 Dashboard 計算好的 risk_data，
-    # 但需要重新計算完整的歷史動能與避險訊號
-    
-    with st.spinner("正在進行歷史運算..."):
+    with st.spinner("正在進行歷史運算 (History Calculation)..."):
         # 1. 歷史動能 (Monthly)
         monthly_prices = data[list(MAPPING.keys())].resample('M').last()
         hist_winners = pd.Series(index=monthly_prices.index, dtype='object')
         
         # 向量化計算動能 (簡化版加速)
-        # 這裡用簡單的回報率總和近似 Z-Score (為了 Web App 響應速度)
-        # 若要精確 Z-Score 需迴圈，這裡演示核心邏輯
         mom_score = pd.DataFrame(0.0, index=monthly_prices.index, columns=monthly_prices.columns)
         for m in MOM_PERIODS:
             mom_score += monthly_prices.pct_change(m)
         
-        # 找出每個月的 Winner
         for date in mom_score.index:
             hist_winners[date] = mom_score.loc[date].idxmax()
         
         # 2. 歷史避險訊號 (Daily)
-        # 比較 GLD vs TLT 252天回報
         safe_mom = data[SAFE_POOL].pct_change(252)
         hist_safe = safe_mom.idxmax(axis=1).fillna('TLT')
         
         # 3. 逐日回測迴圈
         dates = data.index
-        # 找出共同起始點
-        start_idx = 252 # 暖機期
+        start_idx = 252 
         
         strategy_ret = []
         valid_dates = []
         
-        # 持倉統計
-        hold_counts = {t:0 for t in list(MAPPING.keys()) + SAFE_POOL}
+        # [修正] 使用 defaultdict 防止 KeyError
+        hold_counts = defaultdict(float)
         
         prev_pos = {} # {ticker: weight}
         
-        # 進度條
         progress_bar = st.progress(0)
         total_steps = len(dates) - start_idx
         
@@ -349,24 +374,28 @@ if st.button("🚀 開始執行回測"):
             
             target_risky = past_wins.iloc[-1]
             
+            # 檢核 target_risky 是否有效 (防止 NaN 導致 KeyError)
+            if pd.isna(target_risky) or target_risky not in MAPPING:
+                continue
+
             # 決定權重
-            # 檢查該標的是否有風控數據
             if target_risky in risk_data and today in risk_data[target_risky].index:
                 w_risk = risk_data[target_risky].loc[today, 'Weight']
             else:
-                w_risk = 0.0 # 若無數據預設避險
+                w_risk = 0.0 
                 
             w_safe = 1.0 - w_risk
             
             # 決定避險標的
             target_safe = hist_safe.loc[today]
+            if pd.isna(target_safe): target_safe = 'TLT' # 防呆
             
             # 建構倉位
             curr_pos = {}
             if w_risk > 0: curr_pos[target_risky] = w_risk
             if w_safe > 0: curr_pos[target_safe] = w_safe
             
-            # 統計
+            # 統計 (使用 defaultdict 安全累加)
             hold_counts[target_risky] += w_risk
             hold_counts[target_safe] += w_safe
             
@@ -404,7 +433,6 @@ if st.button("🚀 開始執行回測"):
         
         # Benchmark (VT)
         if 'VT' not in data.columns:
-            # 如果沒下載 VT，用 SPY 代替
             bench_ret = data['SPY'].loc[valid_dates].pct_change().fillna(0)
         else:
             bench_ret = data['VT'].loc[valid_dates].pct_change().fillna(0)
@@ -432,9 +460,7 @@ if st.button("🚀 開始執行回測"):
             pct = v / total_d
             if pct > 0.01: alloc_str += f"{k}:{pct:.0%} "
             
-        # --- C. 顯示結果 (依照您的範例格式) ---
-        
-        # 1. 關鍵指標
+        # --- C. 顯示結果 ---
         st.write("### 📈 回測績效指標")
         m1, m2, m3, m4, m5 = st.columns(5)
         
@@ -454,7 +480,7 @@ if st.button("🚀 開始執行回測"):
         
         st.markdown(f"**資產分佈 (時間加權):** {alloc_str}")
         
-        # 2. Altair 圖表
+        # Altair Charts
         st.write("### 📊 權益曲線與回撤")
         
         df_chart = pd.DataFrame({
@@ -472,7 +498,6 @@ if st.button("🚀 開始執行回測"):
         
         st.altair_chart(chart, use_container_width=True)
         
-        # 回撤圖
         df_dd_chart = pd.DataFrame({
             'Date': cum_eq.index,
             'Drawdown': dd
