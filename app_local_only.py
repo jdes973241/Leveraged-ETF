@@ -11,7 +11,7 @@ import warnings
 # ==========================================
 # 0. 頁面設定與參數
 # ==========================================
-st.set_page_config(page_title="Dynamic Momentum Strategy (Final)", layout="wide")
+st.set_page_config(page_title="Dynamic Momentum Strategy (Extended)", layout="wide")
 warnings.simplefilter(action='ignore')
 
 # CSS 美化
@@ -25,40 +25,25 @@ st.markdown("""
         text-align: center;
         box-shadow: 0 2px 4px rgba(0,0,0,0.05);
     }
-    .metric-label {
-        font-size: 14px; 
-        color: #555555; 
-        margin-bottom: 0;
-        font-weight: 500;
-    }
-    .metric-value {
-        font-size: 24px; 
-        font-weight: bold; 
-        color: #000000 !important; 
-        margin: 5px 0;
-    }
-    .metric-sub {
-        font-size: 12px; 
-        color: #666666; 
-        margin-bottom: 0;
-    }
+    .metric-label {font-size: 14px; color: #555555; margin-bottom: 0; font-weight: 500;}
+    .metric-value {font-size: 24px; font-weight: bold; color: #000000 !important; margin: 5px 0;}
+    .metric-sub {font-size: 12px; color: #666666; margin-bottom: 0;}
     .buy-text {color: #28a745; font-weight: bold;}
     .sell-text {color: #dc3545; font-weight: bold;}
 </style>
 """, unsafe_allow_html=True)
 
 # === 核心參數 ===
-MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"} # 3x -> 1x
+MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"} 
 SAFE_POOL = ["GLD", "TLT"] 
 
-# 統一動態分位數: Exit Q74 / Entry Q59
 RISK_CONFIG = {
     "UPRO": {"exit_q": 0.74, "entry_q": 0.59},
     "EURL": {"exit_q": 0.74, "entry_q": 0.59},
     "EDC":  {"exit_q": 0.74, "entry_q": 0.59}
 }
 
-ROLLING_WINDOW_SIZE = 1260 # GARCH 訓練視窗
+ROLLING_WINDOW_SIZE = 1260 # Live 模式用 5 年
 SMA_WINDOW = 200
 MOM_PERIODS = [3, 6, 9, 12]
 TRANSACTION_COST = 0.001 
@@ -201,7 +186,7 @@ def get_safe_asset_status(data):
 @st.cache_data(ttl=3600, show_spinner="生成合成數據中...")
 def get_synthetic_backtest_data():
     """下載 1x 原型並生成合成 3x 數據 + VT"""
-    tickers = list(MAPPING.values()) + SAFE_POOL + ['VT'] # 新增 VT
+    tickers = list(MAPPING.values()) + SAFE_POOL + ['VT']
     try:
         data_1x = yf.download(tickers, period="max", interval="1d", auto_adjust=True, progress=False)
         if isinstance(data_1x.columns, pd.MultiIndex):
@@ -211,12 +196,10 @@ def get_synthetic_backtest_data():
         data_1x = data_1x.ffill().dropna()
         synthetic_data = pd.DataFrame(index=data_1x.index)
         
-        # 複製避險資產 與 VT
         for t in SAFE_POOL + ['VT']:
             if t in data_1x.columns:
                 synthetic_data[t] = data_1x[t]
             
-        # 生成合成 3x 數據
         REVERSE_MAP = {v: k for k, v in MAPPING.items()} 
         
         for ticker_1x in MAPPING.values():
@@ -224,6 +207,7 @@ def get_synthetic_backtest_data():
             ret_1x = data_1x[ticker_1x].pct_change().fillna(0)
             costs = pd.Series([get_daily_leverage_cost(d) for d in ret_1x.index], index=ret_1x.index)
             ret_3x = (ret_1x * 3.0) - costs
+            
             syn_price = (1 + ret_3x).cumprod() * 100
             
             synthetic_data[ticker_3x] = syn_price
@@ -248,7 +232,6 @@ risk_data = calculate_risk_metrics(data)
 selection_df = calculate_selection_metrics(data)
 safe_winner, safe_details_df = get_safe_asset_status(data)
 
-# Dashboard 狀態
 latest_date = data.index[-1]
 winner_ticker = selection_df.index[0] 
 
@@ -289,41 +272,24 @@ with st.expander("📖 策略白皮書 (Strategy Whitepaper)", expanded=False):
     * **規則**: 比較兩者過去 12 個月績效，持有較強者。
     """)
 
-# --- Top Summary ---
+# --- Dashboard Content ---
 c1, c2, c3, c4 = st.columns(4)
-
-with c1:
-    st.metric("🏆 本月進攻贏家", winner_ticker, "Rank #1")
-
+with c1: st.metric("🏆 本月進攻贏家", winner_ticker, "Rank #1")
 with c2:
-    if final_weight == 1.0: 
-        st.markdown(f"### 🎯 權重: :green[100%]")
-        st.caption(f"持有 {winner_ticker}")
-    elif final_weight == 0.5:
-        st.markdown(f"### 🎯 權重: :orange[50%]")
-        st.caption(f"50% {winner_ticker} + 50% {safe_winner}")
-    else:
-        st.markdown(f"### 🎯 權重: :red[0%]")
-        st.caption(f"100% {safe_winner} (避險)")
-
+    if final_weight == 1.0: st.markdown(f"### 🎯 權重: :green[100%]")
+    elif final_weight == 0.5: st.markdown(f"### 🎯 權重: :orange[50%]")
+    else: st.markdown(f"### 🎯 權重: :red[0%]")
 with c3:
     g_state = latest_risk_row['GARCH_State']
-    st.metric("波動率風控 (GARCH)", 
-              "安全" if g_state == 1.0 else "危險", 
-              delta="✅" if g_state == 1.0 else "🔻")
-
+    st.metric("波動率風控 (GARCH)", "安全" if g_state == 1.0 else "危險", delta="✅" if g_state == 1.0 else "🔻")
 with c4:
     safe_ret = safe_details_df.loc[safe_winner, '12M Return']
-    st.metric("🛡️ 當前最佳避險", safe_winner, 
-              f"12M Ret: {safe_ret:.1%}")
+    st.metric("🛡️ 當前最佳避險", safe_winner, f"12M Ret: {safe_ret:.1%}")
 
 st.divider()
 
-# --- 透視表格 ---
 st.subheader("📊 策略透視")
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "1️⃣ 數據層", "2️⃣ 風控層", "3️⃣ 權重層", "4️⃣ 選股層", "5️⃣ 避險資產層", "6️⃣ 執行層"
-])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["1️⃣ 數據層", "2️⃣ 風控層", "3️⃣ 權重層", "4️⃣ 選股層", "5️⃣ 避險資產層", "6️⃣ 執行層"])
 
 with tab1:
     st.caption("最新市場價格 (含 1x 原型)")
@@ -351,8 +317,7 @@ with tab3:
         if ticker in risk_data:
             row = risk_data[ticker].iloc[-1]
             w_summary.append({
-                "標的": ticker, "GARCH(0/1)": int(row['GARCH_State']), 
-                "SMA(0/1)": int(row['SMA_State']), "總權重": row['Weight']
+                "標的": ticker, "GARCH(0/1)": int(row['GARCH_State']), "SMA(0/1)": int(row['SMA_State']), "總權重": row['Weight']
             })
     st.dataframe(pd.DataFrame(w_summary), use_container_width=True)
 
@@ -364,21 +329,14 @@ with tab5:
     st.caption("避險資產輪動 (Safe Asset Rotation)")
     safe_display = safe_details_df.copy()
     safe_display['Selected'] = safe_display.index.map(lambda x: '✅' if x == safe_winner else '')
-    st.dataframe(
-        safe_display.style.format({
-            "Current Price": "{:.2f}", "12M Ago Price": "{:.2f}", "12M Return": "{:.2%}"
-        }).map(lambda x: 'color: green' if x == '✅' else '', subset=['Selected']),
-        use_container_width=True
-    )
+    st.dataframe(safe_display.style.format({"Current Price": "{:.2f}", "12M Ago Price": "{:.2f}", "12M Return": "{:.2%}"}).map(lambda x: 'color: green' if x == '✅' else '', subset=['Selected']), use_container_width=True)
 
 with tab6:
     st.markdown("#### 🚀 最終執行指令")
     holdings = []
-    if final_weight > 0:
-        holdings.append(f"**{final_weight*100:.0f}% {winner_ticker}** (進攻)")
+    if final_weight > 0: holdings.append(f"**{final_weight*100:.0f}% {winner_ticker}** (進攻)")
     safe_weight = 1.0 - final_weight
-    if safe_weight > 0:
-        holdings.append(f"**{safe_weight*100:.0f}% {safe_winner}** (避險)")
+    if safe_weight > 0: holdings.append(f"**{safe_weight*100:.0f}% {safe_winner}** (避險)")
     st.success(f"建議組合: {' + '.join(holdings)}")
 
 # ==========================================
@@ -393,18 +351,19 @@ syn_data = get_synthetic_backtest_data()
 if syn_data.empty:
     st.warning("合成數據生成失敗。")
 else:
-    # 暖機期設定
-    # 為了展示 2008 年數據，我們使用較短的 GARCH 窗口進行回測演示
-    # 若要嚴格符合 5 年窗口，數據會從 2010 開始
-    BACKTEST_GARCH_WINDOW = 504 
+    # 縮短暖機期以最大化回測長度
+    # 為了能看到 2008，我們只使用 1 年 (252天) 的 GARCH 暖機
+    BACKTEST_GARCH_WINDOW = 252 
     est_start_date = syn_data.index[0] + timedelta(days=(BACKTEST_GARCH_WINDOW + 252) * 1.45) 
     start_date_str = est_start_date.strftime('%Y-%m-%d')
 
-    st.caption(f"""
-    設定說明：
-    - **回測起點**：約 {start_date_str} (數據源含 2008 海嘯)
-    - **比較基準 1**：UPRO + EURL + EDC (合成 3x / 每季等權重)
-    - **比較基準 2**：VT (Vanguard Total World Stock ETF)
+    st.info(f"""
+    **回測設定說明：**
+    1.  **數據源**：使用 1x 原型 ETF (SPY/VGK/EEM) 透過數學模型合成 3x 槓桿數據。
+    2.  **合成邏輯**：`Daily_3x = (Daily_1x * 3.0) - 動態借貸成本 (2%~5% pa)`。
+    3.  **回測區間**：約 {start_date_str} 起 (涵蓋 2008 金融海嘯)。
+    4.  **交易成本**：每次換倉或再平衡扣除 **0.1%** (含滑價與手續費)。
+    5.  **基準 (Benchmark)**：UPRO + EURL + EDC (每季等權重再平衡)。
     """)
 
     if st.button("🚀 開始執行回測 (Synthetic)"):
@@ -419,6 +378,8 @@ else:
                 r = s.pct_change() * 100
                 sma = s.rolling(SMA_WINDOW).mean()
                 
+                # 為了回測，使用全區間 fit 但 rolling predict，或者簡化為 full fit
+                # 這裡為了速度和穩定性，使用 full fit 近似，但應用時 shift 1
                 win = r.dropna()
                 am = arch_model(win, vol='Garch', p=1, q=1, dist='t', rescale=False)
                 res = am.fit(disp='off', show_warning=False)
@@ -453,7 +414,8 @@ else:
             
             # 4. 逐日回測
             dates = syn_data.index
-            start_idx = 504 + 252 
+            # Start Index: GARCH Warmup + Mom Warmup
+            start_idx = BACKTEST_GARCH_WINDOW + 252
             
             strategy_ret = []
             valid_dates = []
@@ -513,7 +475,7 @@ else:
             cum_eq = (1 + eq).cumprod()
             dd = cum_eq / cum_eq.cummax() - 1
             
-            # Benchmark 1: Syn 3x EqW (Quarterly)
+            # Benchmark 1 (3x Qtly EqW)
             b_subset = syn_data[list(MAPPING.keys())].loc[valid_dates].copy()
             b_equity_series = pd.Series(1.0, index=b_subset.index)
             curr_cap = 1.0
@@ -530,15 +492,19 @@ else:
                 val = rel.mean(axis=1) * curr_cap
                 b_equity_series.loc[t_s:t_e] = val
                 curr_cap = val.iloc[-1]
+            bench_eq = b_equity_series
+            bench_dd = bench_eq / bench_eq.cummax() - 1
             
-            # Benchmark 2: VT (Buy & Hold)
+            # Benchmark 2 (VT)
             if 'VT' in syn_data.columns:
                 vt_ret = syn_data['VT'].loc[valid_dates].pct_change().fillna(0)
                 vt_eq = (1 + vt_ret).cumprod()
+                vt_dd = vt_eq / vt_eq.cummax() - 1
             else:
-                vt_eq = pd.Series(1.0, index=valid_dates) # Fallback
+                vt_eq = pd.Series(1.0, index=valid_dates)
+                vt_dd = pd.Series(0.0, index=valid_dates)
             
-            # Stats Helper
+            # Stats
             def calc_stats(equity, daily_r):
                 if len(equity) < 1: return 0,0,0,0
                 d = (equity.index[-1] - equity.index[0]).days
@@ -551,16 +517,13 @@ else:
                 return cagr, sortino, roll5, mdd
 
             s_cagr, s_sort, s_roll, s_mdd = calc_stats(cum_eq, eq)
-            b3_cagr, b3_sort, b3_roll, b3_mdd = calc_stats(b_equity_series, b_equity_series.pct_change().fillna(0))
-            vt_cagr, vt_sort, vt_roll, vt_mdd = calc_stats(vt_eq, vt_eq.pct_change().fillna(0))
+            b_cagr, b_sort, b_roll, b_mdd = calc_stats(bench_eq, bench_eq.pct_change().fillna(0))
+            v_cagr, v_sort, v_roll, v_mdd = calc_stats(vt_eq, vt_eq.pct_change().fillna(0))
             
             total_d = len(valid_dates)
             time_in_mkt = (hold_counts['UPRO'] + hold_counts['EURL'] + hold_counts['EDC']) / total_d
             
-            alloc_str = ""
-            for k, v in hold_counts.items():
-                pct = v / total_d
-                if pct > 0.01: alloc_str += f"{k}:{pct:.0%} "
+            alloc_str = " | ".join([f"{k}:{v/total_d:.0%}" for k, v in hold_counts.items() if v/total_d > 0.01])
             
             # --- Display ---
             st.write("### 📈 回測績效指標")
@@ -569,55 +532,66 @@ else:
             def metric_box(label, value, b3_val=None, vt_val=None, fmt="{:.2%}"):
                 b3_str = f"3x: {fmt.format(b3_val)}" if b3_val is not None else ""
                 vt_str = f"VT: {fmt.format(vt_val)}" if vt_val is not None else ""
-                sub_str = f"{b3_str} | {vt_str}"
-                
                 st.markdown(f"""
                 <div class="metric-card">
                     <p class="metric-label">{label}</p>
                     <p class="metric-value">{fmt.format(value)}</p>
-                    <p class="metric-sub">{sub_str}</p>
+                    <p class="metric-sub">{b3_str} | {vt_str}</p>
                 </div>
                 """, unsafe_allow_html=True)
 
-            with m1: metric_box("CAGR", s_cagr, b3_cagr, vt_cagr)
-            with m2: metric_box("Sortino", s_sort, b3_sort, vt_sort, "{:.2f}")
-            with m3: metric_box("Avg 5Y Roll", s_roll, b3_roll, vt_roll)
-            with m4: metric_box("Max DD", s_mdd, b3_mdd, vt_mdd)
+            with m1: metric_box("CAGR", s_cagr, b_cagr, v_cagr)
+            with m2: metric_box("Sortino", s_sort, b_sort, v_sort, "{:.2f}")
+            with m3: metric_box("Avg 5Y Roll", s_roll, b_roll, v_roll)
+            with m4: metric_box("Max DD", s_mdd, b_mdd, v_mdd)
             with m5: metric_box("Time in 3x", time_in_mkt, None, None) 
             
-            st.markdown(f"**資產分佈 (時間加權):** {alloc_str}")
+            st.markdown(f"**平均資產分佈:** {alloc_str}")
             
             # Charts
-            st.write("### 📊 權益曲線與回撤")
+            st.write("### 📊 權益曲線、回撤與滾動報酬")
             
+            # 1. Equity
             df_chart = pd.DataFrame({
                 'Date': cum_eq.index,
-                'Strategy': cum_eq - 1,
-                'Bench (3x EqW)': b_equity_series - 1,
-                'Bench (VT)': vt_eq - 1
-            }).melt('Date', var_name='Asset', value_name='Return')
+                'Strategy': cum_eq,
+                'Bench (3x EqW)': bench_eq,
+                'Bench (VT)': vt_eq
+            }).melt('Date', var_name='Asset', value_name='NAV')
             
             chart = alt.Chart(df_chart).mark_line().encode(
                 x='Date',
-                y=alt.Y('Return', axis=alt.Axis(format='%')),
+                y=alt.Y('NAV', axis=alt.Axis(title='NAV (Log)'), scale=alt.Scale(type='log')),
                 color=alt.Color('Asset', scale=alt.Scale(domain=['Strategy', 'Bench (3x EqW)', 'Bench (VT)'], range=['#1f77b4', '#999999', '#2ca02c'])),
-                tooltip=['Date', 'Asset', alt.Tooltip('Return', format='.2%')]
-            ).properties(height=400, title="累積報酬率 (Cumulative Return)").interactive()
-            
+                tooltip=['Date', 'Asset', alt.Tooltip('NAV', format='.2f')]
+            ).properties(height=350, title="權益曲線 (Log Scale)").interactive()
             st.altair_chart(chart, use_container_width=True)
             
-            df_dd_chart = pd.DataFrame({
+            # 2. Drawdown
+            df_dd = pd.DataFrame({
                 'Date': cum_eq.index,
                 'Strategy': dd,
-                'Bench (3x EqW)': b_equity_series / b_equity_series.cummax() - 1,
-                'Bench (VT)': vt_eq / vt_eq.cummax() - 1
+                'Bench (3x EqW)': bench_dd,
+                'Bench (VT)': vt_dd
             }).melt('Date', var_name='Asset', value_name='Drawdown')
             
-            chart_dd = alt.Chart(df_dd_chart).mark_line().encode(
-                x='Date',
-                y=alt.Y('Drawdown', axis=alt.Axis(format='%')),
-                color=alt.Color('Asset', scale=alt.Scale(domain=['Strategy', 'Bench (3x EqW)', 'Bench (VT)'], range=['#ff7f0e', '#999999', '#2ca02c'])),
-                tooltip=['Date', 'Asset', alt.Tooltip('Drawdown', format='.2%')]
-            ).properties(height=200, title="回撤 (Drawdown)").interactive()
-            
+            chart_dd = alt.Chart(df_dd).mark_line().encode(
+                x='Date', y=alt.Y('Drawdown', axis=alt.Axis(format='%')),
+                color='Asset', tooltip=['Date', 'Asset', alt.Tooltip('Drawdown', format='.2%')]
+            ).properties(height=200, title="回撤幅度").interactive()
             st.altair_chart(chart_dd, use_container_width=True)
+            
+            # 3. Rolling 5Y
+            roll5_s = cum_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260) - 1)
+            roll5_b = bench_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260) - 1)
+            roll5_v = vt_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260) - 1)
+            
+            df_roll = pd.DataFrame({
+                'Date': cum_eq.index, 'Strategy': roll5_s, 'Bench (3x)': roll5_b, 'Bench (VT)': roll5_v
+            }).melt('Date', var_name='Asset', value_name='CAGR')
+            
+            chart_roll = alt.Chart(df_roll.dropna()).mark_line().encode(
+                x='Date', y=alt.Y('CAGR', axis=alt.Axis(format='%')),
+                color='Asset', tooltip=['Date', 'Asset', alt.Tooltip('CAGR', format='.2%')]
+            ).properties(height=250, title="滾動 5 年年化報酬率 (Rolling 5Y CAGR)").interactive()
+            st.altair_chart(chart_roll, use_container_width=True)
