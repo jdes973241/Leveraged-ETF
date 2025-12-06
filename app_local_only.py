@@ -4,255 +4,338 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from arch import arch_model
-from tqdm import tqdm # 雖然在 Streamlit 不直接用 tqdm，但 GARCH 函數裡保留
+from datetime import datetime, timedelta
 import warnings
 
-# 忽略警告
+# ==========================================
+# 0. 頁面設定與參數
+# ==========================================
+st.set_page_config(page_title="Dynamic Momentum Strategy", layout="wide")
 warnings.simplefilter(action='ignore')
 
-# ==========================================
-# 0. 設定與參數 (與最終白皮書一致)
-# ==========================================
-st.set_page_config(page_title="Local Risk Dual Momentum", layout="wide")
+# CSS 美化
+st.markdown("""
+<style>
+    .metric-card {background-color: #f9f9f9; padding: 15px; border-radius: 10px; border-left: 5px solid #1f77b4;}
+    .buy {color: #28a745; font-weight: bold;}
+    .sell {color: #dc3545; font-weight: bold;}
+    .neutral {color: #6c757d; font-weight: bold;}
+</style>
+""", unsafe_allow_html=True)
 
-MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"}
+# 策略參數
+MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"} # 3x -> 1x
 RISK_CONFIG = {
     "UPRO": {"exit_q": 0.85, "entry_q": 0.70},
     "EURL": {"exit_q": 0.97, "entry_q": 0.82},
     "EDC":  {"exit_q": 0.70, "entry_q": 0.55}
 }
 ROLLING_WINDOW_SIZE = 1260
-TRANSACTION_COST = 0.001
 SMA_WINDOW = 200
 MOM_PERIODS = [3, 6, 9, 12]
-TRADE_TICKERS = list(MAPPING.keys())
 
 # ==========================================
-# 1. 數據與 GARCH 核心計算 (含快取)
+# 1. 核心邏輯函數 (快取優化)
 # ==========================================
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def calculate_rolling_garch_forecast(returns, window_size):
-    """每日重新訓練 GARCH 模型並預測下一日波動率"""
-    n = len(returns)
-    forecasts = {}
-    returns.index = pd.to_datetime(returns.index)
+@st.cache_data(ttl=3600, show_spinner="正在下載市場數據...")
+def get_market_data():
+    """下載所有相關標的數據"""
+    tickers = list(MAPPING.keys()) + list(MAPPING.values())
+    # 下載較長歷史以確保指標計算準確
+    data = yf.download(tickers, period="5y", interval="1d", auto_adjust=True, progress=False)
     
-    # 使用 Streamlit progress bar 替代表準 tqdm 
-    progress_bar = st.empty()
-    
-    for i in range(window_size, n):
-        if i % 50 == 0:
-            progress = min(1.0, (i - window_size) / (n - window_size))
-            progress_bar.progress(progress)
-            
-        train_data = returns.iloc[i-window_size : i]
-        target_date = returns.index[i]
-        
-        try:
-            model = arch_model(train_data, vol='Garch', p=1, q=1, dist='t', rescale=False)
-            res = model.fit(disp='off', show_warning=False)
-            fc = res.forecast(horizon=1, reindex=False)
-            vol_annual = np.sqrt(fc.variance.iloc[-1].values[0]) * np.sqrt(252)
-            forecasts[target_date] = vol_annual
-        except Exception:
-            if len(forecasts) > 0: forecasts[target_date] = list(forecasts.values())[-1]
-            else: forecasts[target_date] = np.nan
-            
-    progress_bar.empty()
-    return pd.Series(forecasts)
-
-@st.cache_data(ttl=3600, show_spinner="下載數據與計算訊號中...")
-def get_data_and_signals():
-    all_tickers = list(set(TRADE_TICKERS + list(MAPPING.values())))
-    data = yf.download(all_tickers, period="max", interval="1d", auto_adjust=True, progress=False)
-    
-    # 數據清洗與對齊
     if isinstance(data.columns, pd.MultiIndex):
         if 'Close' in data.columns.levels[0]: data = data['Close']
         else: data = data['Close'] if 'Close' in data else data
-            
-    start_filter = pd.Timestamp.now() - pd.DateOffset(years=10) # 為了速度縮短回測期
-    data = data.loc[start_filter:].ffill().dropna()
     
-    risk_weights = pd.DataFrame(index=data.index, columns=TRADE_TICKERS)
+    return data.ffill().dropna()
+
+@st.cache_data(ttl=3600, show_spinner="正在計算 GARCH 風控模型...")
+def calculate_risk_metrics(data):
+    """計算風控層的所有數據：GARCH Vol, Thresholds, SMA"""
+    risk_details = {}
     
-    # 逐一處理每個配對
     for trade_t, signal_t in MAPPING.items():
-        s_series = data[signal_t]
-        s_ret = s_series.pct_change() * 100
-        s_sma = s_series.rolling(SMA_WINDOW).mean()
+        # 取得訊號源 (1x) 數據
+        series = data[signal_t]
+        ret = series.pct_change() * 100
+        sma = series.rolling(SMA_WINDOW).mean()
         
-        # 執行滾動 GARCH (耗時)
-        rolling_vol = calculate_rolling_garch_forecast(s_ret.dropna(), ROLLING_WINDOW_SIZE)
+        # GARCH 計算 (為了 Dashboard 速度，我們只計算最近 2 年的滾動數據)
+        # 注意：這裡為了即時顯示，我們用全區間擬合參數來預測最後一天的波動率 (快速近似)
+        # 若要嚴謹的回測請用 backtest 專用代碼
+        window = ret.dropna().tail(1260) 
         
-        temp = pd.DataFrame({'Vol': rolling_vol, 'Price': s_series, 'SMA': s_sma}).dropna()
+        # 1. 計算 GARCH 波動率序列 (Conditional Volatility)
+        # 這裡我們需要"序列"來計算歷史分位數，所以不能只算最後一天
+        am = arch_model(window, vol='Garch', p=1, q=1, dist='t', rescale=False)
+        res = am.fit(disp='off', show_warning=False)
+        cond_vol = res.conditional_volatility * np.sqrt(252) # 年化
         
+        # 2. 整合 DataFrame
+        df = pd.DataFrame({
+            'Price': series,
+            'Ret': ret,
+            'SMA': sma,
+        }).join(cond_vol.rename('Vol'), how='inner')
+        
+        # 3. 計算動態閾值 (Rolling Quantile)
         cfg = RISK_CONFIG[trade_t]
-        roll_exit = temp['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
-        roll_entry = temp['Vol'].rolling(252).quantile(cfg['entry_q']).shift(1)
+        # Shift(1) 模擬實際交易：今天的閾值是由昨天以前的數據決定的
+        df['Exit_Th'] = df['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
+        df['Entry_Th'] = df['Vol'].rolling(252).quantile(cfg['entry_q']).shift(1)
         
-        g_sig = pd.Series(np.nan, index=temp.index)
-        valid = roll_exit.notna() & roll_entry.notna()
-        g_sig.loc[valid & (temp['Vol'] > roll_exit)] = 0.0
-        g_sig.loc[valid & (temp['Vol'] < roll_entry)] = 1.0
-        g_sig = g_sig.ffill().fillna(0.0) # 冷啟動預設空手
+        # 4. 生成訊號狀態
+        # GARCH 狀態機
+        df['GARCH_State'] = np.nan
+        valid = df['Exit_Th'].notna()
+        df.loc[valid & (df['Vol'] > df['Exit_Th']), 'GARCH_State'] = 0.0 # 避險
+        df.loc[valid & (df['Vol'] < df['Entry_Th']), 'GARCH_State'] = 1.0 # 持有
+        df['GARCH_State'] = df['GARCH_State'].ffill().fillna(1.0) # 預設持有
         
-        sma_sig = (temp['Price'] > temp['SMA']).astype(float)
-        risk_weights[trade_t] = (0.5 * g_sig) + (0.5 * sma_sig)
+        # SMA 狀態
+        df['SMA_State'] = (df['Price'] > df['SMA']).astype(float)
         
-    return data, risk_weights.dropna()
+        # 混合權重
+        df['Weight'] = (0.5 * df['GARCH_State']) + (0.5 * df['SMA_State'])
+        
+        risk_details[trade_t] = df
+        
+    return risk_details
 
-def calculate_momentum(data):
-    # 僅計算 3x 交易標的的動能
-    monthly_prices = data[TRADE_TICKERS].resample('M').last()
-    winners = pd.Series(index=monthly_prices.index, dtype='object')
+@st.cache_data(ttl=3600)
+def calculate_selection_metrics(data):
+    """計算動能選股層數據"""
+    # 使用 3x 交易標的計算動能
+    prices = data[list(MAPPING.keys())]
     
-    # 這裡的動能計算邏輯與最終白皮書一致 (Risk-Adjusted Z-Score)
-    # ... (計算動能的邏輯與上一個程式碼相同，這裡為節省篇幅省略細節) ...
-    # 為了保持程式碼完整性，我將使用一個簡化但功能相同的動能計算
+    # 取最新一天與各週期的回報
+    latest_date = prices.index[-1]
     
-    for i in range(13, len(monthly_prices)):
-        curr_date = monthly_prices.index[i]
-        z_sum = pd.Series(0.0, index=TRADE_TICKERS)
+    metrics = []
+    for ticker in prices.columns:
+        row = {'Ticker': ticker}
+        p_now = prices[ticker].iloc[-1]
         
+        # 計算各週期 Return
         for m in MOM_PERIODS:
-            # 這裡需要完整的動能計算邏輯，但為了不重複冗長代碼，我們假設它已完成
-            # 簡化: 假設 UPRO 在過去十年內勝率最高
-            z_sum['UPRO'] += 1.0 # 僅為展示目的
-            z_sum['EURL'] += 0.5
-            z_sum['EDC'] -= 0.5
+            # 概抓交易日 (1個月約21天)
+            lookback = m * 21
+            if len(prices) > lookback:
+                p_prev = prices[ticker].iloc[-1-lookback]
+                ret = (p_now - p_prev) / p_prev
+                row[f'Ret_{m}M'] = ret
+            else:
+                row[f'Ret_{m}M'] = np.nan
+                
+        # 計算波動率 (風險調整用) - 使用過去 6 個月日波動
+        vol_window = 126
+        daily_ret = prices[ticker].pct_change().tail(vol_window)
+        vol = daily_ret.std() * np.sqrt(252)
+        row['Vol_Ann'] = vol
         
-        winners[curr_date] = z_sum.idxmax()
+        metrics.append(row)
         
-    return winners.dropna()
-
+    df = pd.DataFrame(metrics).set_index('Ticker')
+    
+    # 計算 Z-Score
+    z_score_sum = pd.Series(0.0, index=df.index)
+    
+    for m in MOM_PERIODS:
+        col = f'Ret_{m}M'
+        # Risk Adjusted Return = Ret / Vol
+        risk_adj = df[col] / (df['Vol_Ann'] + 1e-6)
+        
+        # Z-Score
+        z = (risk_adj - risk_adj.mean()) / (risk_adj.std() + 1e-6)
+        df[f'Z_{m}M'] = z
+        z_score_sum += z
+        
+    df['Total_Z'] = z_score_sum
+    df['Rank'] = df['Total_Z'].rank(ascending=False)
+    
+    return df.sort_values('Total_Z', ascending=False)
 
 # ==========================================
-# 2. 應用程式邏輯 (Local Only)
+# 2. 應用程式主邏輯
 # ==========================================
 
-def backtest_local_only(data, risk_weights, winners_series):
-    # 此處邏輯完全不檢查 Global Score (閾值設為 0)
-    
-    strategy_ret = []
-    dates = []
-    
-    prev_ticker = None
-    prev_weight = 0.0
-    
-    # 對齊開始時間
-    start_date = max(risk_weights.index[0], winners_series.index[0])
-    try: start_idx = data.index.get_loc(start_date)
-    except: start_idx = data.index.get_indexer([start_date], method='bfill')[0]
-        
-    for i in range(start_idx, len(data)):
-        today = data.index[i]
-        
-        # 1. 決定目標標的
-        past_signals = winners_series[winners_series.index < today]
-        if past_signals.empty: target_ticker = "CASH"
-        else: target_ticker = past_signals.iloc[-1]
-            
-        # 2. 決定倉位 (只看個別分數 - Local Only)
-        w = risk_weights.loc[today, target_ticker] if today in risk_weights.index else 0.0
-        
-        # 3. 計算交易成本
-        cost = 0.0
-        if target_ticker != prev_ticker: turnover = prev_weight + w
-        else: turnover = abs(w - prev_weight)
-        cost = turnover * TRANSACTION_COST
-            
-        # 4. 計算損益
-        if target_ticker != "CASH" and w > 0:
-            daily_pct = data[target_ticker].pct_change().iloc[i]
-            if np.isnan(daily_pct): daily_pct = 0.0
-            net_ret = (w * daily_pct) - cost
-        else:
-            net_ret = 0.0 - cost # 賣出手續費
-            
-        strategy_ret.append(net_ret)
-        dates.append(today)
-        
-        prev_ticker = target_ticker
-        prev_weight = w
-        
-    equity = pd.Series(strategy_ret, index=dates)
-    return (1 + equity).cumprod()
+# 載入數據
+data = get_market_data()
+risk_data = calculate_risk_metrics(data)
+selection_df = calculate_selection_metrics(data)
+
+# 取得最新日期狀態
+latest_date = data.index[-1]
+winner_ticker = selection_df.index[0] # 排名第一的標的
+
+# 取得 Winner 的風控狀態
+winner_risk_df = risk_data[winner_ticker]
+latest_risk_row = winner_risk_df.iloc[-1]
+final_weight = latest_risk_row['Weight']
 
 # ==========================================
-# 3. Streamlit 介面呈現
+# 3. 前端顯示 (Streamlit Layout)
 # ==========================================
 
-st.title("📊 Local-Only Risk Control Strategy (No Global Filter)")
-st.markdown("Strategy: Momentum Winner takes Local Risk Score (0, 0.5, 1.0). **Systemic Risk is Ignored.**")
+st.title("🛡️ 雙重動能與動態風控策略儀表板")
+st.markdown(f"**數據基準日**: {latest_date.strftime('%Y-%m-%d')}")
 
-# --- 執行主要分析 ---
-if st.button("Run Analysis / Update Signals"):
-    st.session_state['analysis_running'] = True
-    data, risk_weights = get_data_and_signals()
-    winners = calculate_momentum(data) 
-    equity = backtest_local_only(data, risk_weights, winners)
-    st.session_state['equity'] = equity
-    st.session_state['risk_data'] = risk_weights
-    st.session_state['winners'] = winners
-    st.session_state['data'] = data
-    st.session_state['latest_date'] = data.index[-1].date()
-    st.session_state['last_winner'] = winners.iloc[-1]
-    st.session_state['analysis_running'] = False
-else:
-    if 'analysis_running' not in st.session_state:
-         st.session_state['analysis_running'] = False
+# --- 頂部摘要 (Top Summary) ---
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.metric("🏆 本月動能贏家", winner_ticker, f"Rank #1")
+with c2:
+    w_color = "normal"
+    if final_weight == 1.0: w_color = "off" # green implied
+    elif final_weight == 0.0: w_color = "inverse" # red implied
+    st.metric("🎯 建議持倉權重", f"{final_weight*100:.0f}%", delta=None)
+with c3:
+    garch_st = "安全 (持有)" if latest_risk_row['GARCH_State'] == 1.0 else "危險 (避險)"
+    st.metric("波動率風控 (GARCH)", garch_st)
+with c4:
+    sma_st = "多頭 (持有)" if latest_risk_row['SMA_State'] == 1.0 else "空頭 (避險)"
+    st.metric("趨勢風控 (SMA)", sma_st)
 
-if st.session_state['analysis_running']:
-    st.info("Calculating... This may take time due to Rolling GARCH training.")
-elif 'equity' in st.session_state:
-    equity = st.session_state['equity']
-    data = st.session_state['data']
-    risk_weights = st.session_state['risk_data']
-    latest_date = st.session_state['latest_date']
-    last_winner = st.session_state['last_winner']
+st.divider()
 
-    # --- Dashboard - 今日訊號 ---
-    st.header("🚀 Current Market Signals (Local Only)")
-    st.write(f"Data Date: {latest_date}")
+# --- 詳細數據表格 (Tabs) ---
+st.subheader("📊 策略透視 (Strategy Whitebox)")
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "1️⃣ 數據獲取層 (Data)", 
+    "2️⃣ 風控計算層 (Risk Engine)", 
+    "3️⃣ 權重計算層 (Weighting)",
+    "4️⃣ 動能選股層 (Selection)",
+    "5️⃣ 執行決策層 (Execution)"
+])
+
+# 1. 數據獲取層
+with tab1:
+    st.markdown("#### 原始市場數據 (最新 5 日)")
+    st.caption("展示 1x 訊號源 (SPY, VGK, EEM) 與 3x 交易標的 (UPRO, EURL, EDC) 的收盤價與漲跌幅。")
     
-    cols = st.columns(3)
+    display_cols = list(MAPPING.keys()) + list(MAPPING.values())
+    recent_data = data[display_cols].tail(5).sort_index(ascending=False)
     
-    for idx, (ticker, signal_t) in enumerate(MAPPING.items()):
+    # 格式化顯示
+    st.dataframe(recent_data.style.format("{:.2f}"), use_container_width=True)
+
+# 2. 風控計算層
+with tab2:
+    st.markdown("#### 風控指標詳情 (GARCH & Thresholds)")
+    st.caption("針對每個標的，展示當前的預測波動率 (Vol) 與動態歷史分位數閾值 (Exit/Entry)。")
+    
+    risk_summary = []
+    for ticker, signal_t in MAPPING.items():
+        df = risk_data[ticker]
+        row = df.iloc[-1]
         
-        # 從 risk_weights DF 中取得最新的分數
-        last_score = risk_weights.loc[latest_date, ticker]
-        is_winner = (ticker == last_winner)
-        display_weight = last_score if is_winner else 0.0
+        # 準備表格數據
+        cfg = RISK_CONFIG[ticker]
+        vol_status = "🔴 避險" if row['GARCH_State'] == 0 else "🟢 安全"
         
-        with cols[idx]:
-            card_style = "border: 2px solid #28a745;" if is_winner else "border: 1px solid #ddd;"
-            st.markdown(f"""
-            <div style="{card_style} padding: 15px; border-radius: 10px;">
-                <h3>{ticker} <span style="font-size:0.6em; color:gray">({signal_t})</span></h3>
-                <p>Status: <b>{'🏆 WINNER' if is_winner else 'Inactive'}</b></p>
-                <p>Signal Weight: <b>{display_weight*100:.0f}%</b></p>
-                <hr>
-                <p style="font-size:0.8em">Note: This is the local risk score. Global conditions are ignored.</p>
-            </div>
-            """, unsafe_allow_html=True)
-
-    # --- 回測績效圖 ---
-    st.header("📈 Backtest Performance (No Global Filter)")
+        risk_summary.append({
+            "交易標的 (3x)": ticker,
+            "訊號源 (1x)": signal_t,
+            "年化波動率 (Vol)": row['Vol'],
+            "賣出閾值 (Exit)": row['Exit_Th'],
+            "買進閾值 (Entry)": row['Entry_Th'],
+            "設定參數": f"Q{int(cfg['exit_q']*100)} / Q{int(cfg['entry_q']*100)}",
+            "GARCH 狀態": vol_status,
+            "SMA (200)": row['SMA'],
+            "目前價格": row['Price']
+        })
+        
+    risk_df_show = pd.DataFrame(risk_summary)
     
-    # 計算 Benchmark
-    bench_ret = data[list(MAPPING.keys())].loc[equity.index].pct_change().mean(axis=1).fillna(0)
-    bench_eq = (1 + bench_ret).cumprod()
-    
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=equity.index, y=equity.values, name="Local Only Strategy", line=dict(color='blue', width=2)))
-    fig.add_trace(go.Scatter(x=bench_eq.index, y=bench_eq.values, name="Benchmark (Eq Weight)", line=dict(color='gray', dash='dash')))
-    fig.update_layout(yaxis_type="log", title="Cumulative Return (Log Scale)", template="plotly_white", height=500)
-    st.plotly_chart(fig, use_container_width=True)
+    # Apply Styling
+    def highlight_status(val):
+        color = 'red' if '避險' in str(val) else 'green'
+        return f'color: {color}; font-weight: bold'
 
-    # 統計數據 (簡化)
-    cagr = (equity.iloc[-1] / equity.iloc[0]) ** (365.25/(equity.index[-1] - equity.index[0]).days) - 1
-    m1, m2 = st.columns(2)
-    m1.metric("CAGR", f"{cagr*100:.2f}%")
-    m2.metric("Total Return", f"{(equity.iloc[-1]-1)*100:.2f}%")
+    st.dataframe(
+        risk_df_show.style
+        .format({
+            "年化波動率 (Vol)": "{:.2f}%", 
+            "賣出閾值 (Exit)": "{:.2f}%", 
+            "買進閾值 (Entry)": "{:.2f}%",
+            "SMA (200)": "{:.2f}",
+            "目前價格": "{:.2f}"
+        })
+        .map(highlight_status, subset=['GARCH 狀態']),
+        use_container_width=True
+    )
+
+# 3. 混合權重層
+with tab3:
+    st.markdown("#### 權重混合邏輯")
+    st.caption("公式：最終權重 = 0.5 * GARCH訊號 + 0.5 * SMA訊號")
+    
+    weight_summary = []
+    for ticker in MAPPING.keys():
+        df = risk_data[ticker]
+        row = df.iloc[-1]
+        
+        weight_summary.append({
+            "標的": ticker,
+            "GARCH 訊號 (0/1)": int(row['GARCH_State']),
+            "SMA 訊號 (0/1)": int(row['SMA_State']),
+            "計算過程": f"0.5*{int(row['GARCH_State'])} + 0.5*{int(row['SMA_State'])}",
+            "個別總權重": f"{row['Weight']:.1%}"
+        })
+        
+    w_df = pd.DataFrame(weight_summary)
+    st.table(w_df)
+
+# 4. 動能選股層
+with tab4:
+    st.markdown("#### 動能選股排名 (基於 3x 標的)")
+    st.caption("計算 3/6/9/12 個月的風險調整後回報，並進行 Z-Score 排序。")
+    
+    # 格式化選股表
+    sel_style = selection_df.style.format({
+        'Ret_3M': '{:.2%}', 'Ret_6M': '{:.2%}', 'Ret_9M': '{:.2%}', 'Ret_12M': '{:.2%}',
+        'Vol_Ann': '{:.2%}',
+        'Z_3M': '{:.2f}', 'Z_6M': '{:.2f}', 'Z_9M': '{:.2f}', 'Z_12M': '{:.2f}',
+        'Total_Z': '{:.2f}',
+        'Rank': '{:.0f}'
+    }).background_gradient(subset=['Total_Z'], cmap='Greens')
+    
+    st.dataframe(sel_style, use_container_width=True)
+
+# 5. 執行決策層
+with tab5:
+    st.markdown("#### 🚀 最終執行指令 (Action)")
+    
+    action_color = "green" if final_weight > 0 else "red"
+    action_text = "BUY / HOLD" if final_weight > 0 else "SELL / CASH"
+    
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        st.markdown(f"""
+        <div style="text-align: center; border: 2px solid {action_color}; padding: 20px; border-radius: 10px;">
+            <h2 style="color: {action_color}">{action_text}</h2>
+            <h1>{winner_ticker}</h1>
+            <h3>部位: {final_weight*100:.0f}%</h3>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    with col2:
+        st.info(f"""
+        **今日交易指令解析：**
+        1. **選股**：本月動能最強的是 **{winner_ticker}** (Rank #1)。
+        2. **風控**：檢查對應訊號源 **{MAPPING[winner_ticker]}** 的狀態。
+           - GARCH 波動率模型顯示為 **{'安全' if latest_risk_row['GARCH_State']==1 else '危險'}**。
+           - SMA 趨勢模型顯示為 **{'多頭' if latest_risk_row['SMA_State']==1 else '空頭'}**。
+        3. **結論**：綜合得分為 **{final_weight}**。
+           - 若您目前持有 {winner_ticker}，請調整倉位至 {final_weight*100:.0f}%。
+           - 剩餘 {100 - final_weight*100:.0f}% 資金應持有現金或短期國債 (BIL/SHV)。
+        """)
+
+st.divider()
+with st.expander("查看原始數據與參數說明"):
+    st.json(RISK_CONFIG)
+    st.write("GARCH Model: GARCH(1,1) with Student's T distribution.")
+    st.write(f"Rolling Window: {ROLLING_WINDOW_SIZE} days.")
