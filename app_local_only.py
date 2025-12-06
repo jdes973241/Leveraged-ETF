@@ -11,7 +11,7 @@ import warnings
 # ==========================================
 # 0. 頁面設定與參數
 # ==========================================
-st.set_page_config(page_title="Dynamic Momentum Strategy (Final Audited)", layout="wide")
+st.set_page_config(page_title="Dynamic Momentum Strategy (Q80 Fixed)", layout="wide")
 warnings.simplefilter(action='ignore')
 
 # CSS 美化
@@ -37,14 +37,15 @@ st.markdown("""
 MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"} 
 SAFE_POOL = ["GLD", "TLT"] 
 
-# [修正 2] 統一參數為 Q80 / Q65
+# [修正] 參數改為 Q80 / Q65
 RISK_CONFIG = {
     "UPRO": {"exit_q": 0.80, "entry_q": 0.65},
     "EURL": {"exit_q": 0.80, "entry_q": 0.65},
     "EDC":  {"exit_q": 0.80, "entry_q": 0.65}
 }
 
-ROLLING_WINDOW_SIZE = 1260 
+ROLLING_WINDOW_SIZE = 1260 # Live 模式用長窗口
+BACKTEST_GARCH_WINDOW = 504 # 回測模式用短窗口以最大化長度
 SMA_WINDOW = 200
 MOM_PERIODS = [3, 6, 9, 12]
 TRANSACTION_COST = 0.001 
@@ -101,16 +102,13 @@ def calculate_risk_metrics(data):
             df = df.dropna()
 
             cfg = RISK_CONFIG[trade_t]
-            # [修正 1] 避免未來視角: 使用 shift(1)
-            # 今天的閾值是由昨天收盤算出的分布決定的
+            
+            # [嚴格執行] Dashboard 顯示當日數值，Shift 1 代表這是"昨天收盤"算出的閾值，適用於"今天"
             df['Exit_Th'] = df['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
             df['Entry_Th'] = df['Vol'].rolling(252).quantile(cfg['entry_q']).shift(1)
             
             df['GARCH_State'] = np.nan
             valid = df['Exit_Th'].notna()
-            # 訊號判斷: 
-            # 若今日Vol > 今日閾值(昨天算的)，則轉為避險
-            # 這裡邏輯是: 盤中若波動率飆升超過警戒線，收盤確認後，明日執行避險
             df.loc[valid & (df['Vol'] > df['Exit_Th']), 'GARCH_State'] = 0.0 
             df.loc[valid & (df['Vol'] < df['Entry_Th']), 'GARCH_State'] = 1.0 
             df['GARCH_State'] = df['GARCH_State'].ffill().fillna(1.0)
@@ -160,40 +158,25 @@ def calculate_selection_metrics(data):
 
 @st.cache_data(ttl=3600)
 def get_safe_asset_status(data):
-    """
-    [修正 3] 每月調整一次 GLD/TLT
-    邏輯：比較上個月底 (Monthly Resample) 的 12M 報酬
-    """
     if data.empty: return "TLT", {}
     
-    # 取月度數據
+    # Live 模式：顯示當前最新狀態
     monthly = data[SAFE_POOL].resample('M').last()
-    
-    # 確保有足夠歷史
     if len(monthly) > 12:
-        # 比較上個月底的數據 (iloc[-1] 是本月還沒走完的，iloc[-2] 是上個月底)
-        # 實際上 Live Dashboard 應該看「最新已完成的月份」或「當下即時狀態」
-        # 為了符合「每月調整一次」的邏輯，我們只取最近一個「月底」的訊號
-        
-        # 這裡我們取 monthly 的最後一筆 (即最新數據，可能是月中也可能是月底)
-        # 但為了嚴謹，回測邏輯是月初看上個月底。Dashboard 顯示 "當前狀態"
         p_now = monthly.iloc[-1]
-        p_prev = monthly.iloc[-13] # 12個月前
+        p_prev = monthly.iloc[-13] 
         ret_12m = (p_now / p_prev) - 1
     else:
         ret_12m = pd.Series(0.0, index=SAFE_POOL)
     
     winner = ret_12m.idxmax()
-    
     details = pd.DataFrame({
-        "Ticker": SAFE_POOL, 
-        "12M Return": ret_12m.values
+        "Ticker": SAFE_POOL, "12M Return": ret_12m.values
     }).set_index("Ticker")
-    
     return winner, details
 
 # ==========================================
-# 2. 回測專用邏輯 (合成數據 + 長回測)
+# 2. 回測專用邏輯
 # ==========================================
 
 @st.cache_data(ttl=3600, show_spinner="生成長歷史合成數據中 (2005~)...")
@@ -260,7 +243,7 @@ st.caption(f"數據基準日: {latest_date.strftime('%Y-%m-%d')}")
 # 白皮書區塊
 with st.expander("📖 策略白皮書 (Strategy Whitepaper)", expanded=False):
     st.markdown("""
-    ### 策略邏輯摘要
+    ### 策略邏輯摘要 (Updated Q80)
     本策略採用 **訊號與執行分離 (Decoupled Signal)** 架構，利用 1x 原型預測風險，操作 3x 槓桿獲利。
     
     #### 1. 選股引擎 (Selection Engine)
@@ -270,7 +253,9 @@ with st.expander("📖 策略白皮書 (Strategy Whitepaper)", expanded=False):
     
     #### 2. 風控引擎 (Risk Engine)
     * **對象**: SPY, VGK, EEM (1x 原型)。
-    * **A 軌 (GARCH)**: 每日滾動預測波動率。若 `Vol > Exit(Q80)` 避險；若 `Vol < Entry(Q65)` 持有。
+    * **A 軌 (GARCH)**: 每日滾動預測波動率。
+        * **賣出**: 波動率 > 過去一年 Q80
+        * **買回**: 波動率 < 過去一年 Q65
     * **B 軌 (SMA)**: 若價格 > 200MA 持有；否則避險。
     * **權重**: 0.5 * GARCH + 0.5 * SMA。
     
@@ -358,17 +343,19 @@ syn_data = get_synthetic_backtest_data()
 if syn_data.empty:
     st.warning("合成數據生成失敗。")
 else:
-    BACKTEST_GARCH_WINDOW = 504 
-    est_start_date = syn_data.index[0] + timedelta(days=(BACKTEST_GARCH_WINDOW + 252) * 1.45) 
+    # 暖機期：GARCH(504) + Mom(252) + QuantileBuffer(252)
+    # 實際上 GARCH 504 就可以開始產生 Vol，但要累積 Quantile 還要 252
+    # 總共約需 756 天
+    BACKTEST_START_IDX = BACKTEST_GARCH_WINDOW + 252 
+    est_start_date = syn_data.index[0] + timedelta(days=BACKTEST_START_IDX * 1.45) 
     start_date_str = est_start_date.strftime('%Y-%m-%d')
 
     st.caption(f"""
-    **回測設定說明：**
+    **回測設定說明 (Q80版)：**
     1.  **數據源**：使用 1x 原型合成 3x 數據 (含動態損耗)。
     2.  **回測起點**：約 {start_date_str} (確保覆蓋 2008)。
-    3.  **交易成本**：0.1% | **GARCH 暖機**：2 年 (504天)。
-    4.  **避險**：GLD/TLT (每月切換一次)。
-    5.  **基準 (Benchmark)**：UPRO + EURL + EDC (每季等權重)。
+    3.  **交易成本**：0.1% | **暖機期**：約 3 年。
+    4.  **基準 (Benchmark)**：UPRO + EURL + EDC (每季等權重)。
     """)
 
     if st.button("🚀 開始執行回測 (Synthetic)"):
@@ -383,6 +370,7 @@ else:
                 r = s.pct_change() * 100
                 sma = s.rolling(SMA_WINDOW).mean()
                 
+                # 回測使用全區間 fit 近似，但 Signal 使用 Shift 1 (嚴謹)
                 win = r.dropna()
                 am = arch_model(win, vol='Garch', p=1, q=1, dist='t', rescale=False)
                 res = am.fit(disp='off', show_warning=False)
@@ -391,7 +379,7 @@ else:
                 df = pd.DataFrame({'Vol': vol, 'Price': s, 'SMA': sma})
                 cfg = RISK_CONFIG[ticker_3x]
                 
-                # [修正 1] 應用 Shift(1) 避免未來視角
+                # [關鍵] Shift 1 避免未來視角
                 roll_ex = df['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
                 roll_en = df['Vol'].rolling(252).quantile(cfg['entry_q']).shift(1)
                 
@@ -412,14 +400,15 @@ else:
             for m in MOM_PERIODS: mom_score += monthly_prices.pct_change(m)
             hist_winners = mom_score.idxmax(axis=1)
             
-            # 3. 歷史避險 (Rotation) - [修正 3] 月頻
+            # 3. 歷史避險 (Rotation) - [修正] 改為月頻，月初比較上個月底
             safe_monthly = syn_data[SAFE_POOL].resample('M').last()
-            safe_mom = safe_monthly.pct_change(12) # 12個月
+            safe_mom = safe_monthly.pct_change(12) 
             hist_safe = safe_mom.idxmax(axis=1).fillna('TLT')
             
             # 4. 逐日回測
             dates = syn_data.index
-            start_idx = BACKTEST_GARCH_WINDOW + 252 
+            # 確保指標都有值
+            start_idx = BACKTEST_START_IDX 
             
             strategy_ret = []
             valid_dates = []
@@ -432,23 +421,22 @@ else:
                 if i % 100 == 0: progress.progress((i - start_idx) / (len(dates)-start_idx))
                 today = dates[i]
                 
-                # 取得"昨天"的日期 (或上次訊號更新日)
+                # 取得"昨天" (T-1)
                 yesterday = dates[i-1]
                 
-                # [關鍵修正] 使用昨天以前的數據決定今日持倉
+                # [關鍵修正] 使用昨日資訊
                 
-                # A. 決定進攻標的 (每月初更新)
-                # 找到 yesterday 之前最近的一個月底
+                # A. 決定進攻標的 (取yesterday以前最近的月底)
                 past_wins = hist_winners[hist_winners.index <= yesterday]
                 if past_wins.empty: continue
                 target_risky = past_wins.iloc[-1]
                 
-                # B. 決定避險標的 (每月初更新) [修正 3]
+                # B. 決定避險標的 (取yesterday以前最近的月底)
                 past_safe = hist_safe[hist_safe.index <= yesterday]
                 if past_safe.empty: target_safe = 'TLT'
                 else: target_safe = past_safe.iloc[-1]
                 
-                # C. 決定權重 (每日更新)
+                # C. 決定權重 (昨日收盤確認)
                 if target_risky in h_risk_weights.columns and yesterday in h_risk_weights.index:
                     w_risk = h_risk_weights.loc[yesterday, target_risky]
                     if pd.isna(w_risk): w_risk = 0.0
@@ -469,7 +457,7 @@ else:
                     if w_prev != w_curr:
                         cost += abs(w_curr - w_prev) * TRANSACTION_COST
                 
-                # F. 計算損益 (今日漲跌)
+                # F. 計算損益 (今日)
                 day_ret = 0.0
                 if w_risk > 0:
                     r = syn_data[target_risky].pct_change().iloc[i]
@@ -482,6 +470,7 @@ else:
                     
                 strategy_ret.append(day_ret - cost)
                 valid_dates.append(today)
+                
                 hold_counts[target_risky] += w_risk
                 hold_counts[target_safe] += w_safe
                 prev_pos = curr_pos
@@ -568,6 +557,7 @@ else:
             # Charts
             st.write("### 📊 權益曲線與回撤")
             
+            # Equity
             df_chart = pd.DataFrame({
                 'Date': cum_eq.index,
                 'Strategy': cum_eq,
@@ -583,6 +573,7 @@ else:
             ).properties(height=350, title="權益曲線 (Log Scale)").interactive()
             st.altair_chart(chart, use_container_width=True)
             
+            # Drawdown
             df_dd = pd.DataFrame({
                 'Date': cum_eq.index,
                 'Strategy': dd,
@@ -596,6 +587,7 @@ else:
             ).properties(height=200, title="回撤幅度").interactive()
             st.altair_chart(chart_dd, use_container_width=True)
             
+            # Rolling 5Y
             roll5_s = cum_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260) - 1)
             roll5_b = bench_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260) - 1)
             roll5_v = vt_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260) - 1)
