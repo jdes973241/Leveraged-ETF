@@ -17,7 +17,31 @@ warnings.simplefilter(action='ignore')
 # CSS 美化
 st.markdown("""
 <style>
-    .metric-card {background-color: #f9f9f9; padding: 15px; border-radius: 10px; border-left: 5px solid #1f77b4;}
+    /* 修正 metric card，強制深色文字以適配淺底色 */
+    .metric-card {
+        background-color: #eef2f5; 
+        padding: 15px; 
+        border-radius: 8px; 
+        border: 1px solid #d1d5db;
+        text-align: center;
+    }
+    .metric-label {
+        font-size: 14px; 
+        color: #555555; 
+        margin-bottom: 0;
+    }
+    .metric-value {
+        font-size: 24px; 
+        font-weight: bold; 
+        color: #000000;
+        margin: 5px 0;
+    }
+    .metric-sub {
+        font-size: 12px; 
+        color: #666666; 
+        margin-bottom: 0;
+    }
+    
     .buy-text {color: #28a745; font-weight: bold;}
     .sell-text {color: #dc3545; font-weight: bold;}
     .neutral-text {color: #6c757d; font-weight: bold;}
@@ -158,9 +182,7 @@ def get_safe_asset_status(data):
     if data.empty: return "TLT", {}
     
     # 計算過去 12 個月 (252天) 報酬
-    # 取最新數據
     p_now = data[SAFE_POOL].iloc[-1]
-    # 確保有足夠歷史
     if len(data) > 252:
         p_prev = data[SAFE_POOL].iloc[-253]
         ret_12m = (p_now / p_prev) - 1
@@ -169,7 +191,6 @@ def get_safe_asset_status(data):
         
     winner = ret_12m.idxmax()
     
-    # 回傳詳細資訊供表格顯示
     details = pd.DataFrame({
         "Ticker": SAFE_POOL,
         "Current Price": p_now.values,
@@ -282,12 +303,10 @@ with tab4:
     st.caption("動能排名 (Risk-Adjusted Z-Score)")
     st.dataframe(selection_df.style.format("{:.2f}"), use_container_width=True)
 
-# [新增] 避險資產層
 with tab5:
     st.caption("避險資產輪動 (Safe Asset Rotation)")
     st.info("規則：若需要避險 (權重 < 1.0)，則比較 GLD 與 TLT 過去 12 個月的報酬，持有較強者。")
     
-    # 標記贏家
     safe_display = safe_details_df.copy()
     safe_display['Selected'] = safe_display.index.map(lambda x: '✅' if x == safe_winner else '')
     
@@ -303,7 +322,6 @@ with tab5:
 with tab6:
     st.markdown("#### 🚀 最終執行指令")
     
-    # 邏輯判斷
     holdings = []
     if final_weight > 0:
         holdings.append(f"**{final_weight*100:.0f}% {winner_ticker}** (進攻)")
@@ -328,6 +346,7 @@ with tab6:
 st.markdown("---")
 st.header("⏳ 歷史回測分析 (Backtest)")
 st.caption("回測設定：2010 ~ 至今 | 交易成本 0.1% | 避險: 輪動持有 GLD/TLT")
+st.markdown("**基準 (Benchmark)**: UPRO + EURL + EDC (每季等權重再平衡)")
 
 if st.button("🚀 開始執行回測"):
     
@@ -336,7 +355,6 @@ if st.button("🚀 開始執行回測"):
         monthly_prices = data[list(MAPPING.keys())].resample('M').last()
         hist_winners = pd.Series(index=monthly_prices.index, dtype='object')
         
-        # 向量化計算動能 (簡化版加速)
         mom_score = pd.DataFrame(0.0, index=monthly_prices.index, columns=monthly_prices.columns)
         for m in MOM_PERIODS:
             mom_score += monthly_prices.pct_change(m)
@@ -354,52 +372,38 @@ if st.button("🚀 開始執行回測"):
         
         strategy_ret = []
         valid_dates = []
-        
-        # [修正] 使用 defaultdict 防止 KeyError
         hold_counts = defaultdict(float)
-        
-        prev_pos = {} # {ticker: weight}
+        prev_pos = {} 
         
         progress_bar = st.progress(0)
         total_steps = len(dates) - start_idx
         
         for i in range(start_idx, len(dates)):
             if i % 100 == 0: progress_bar.progress((i - start_idx) / total_steps)
-            
             today = dates[i]
             
-            # 決定 Winner (上個月底)
+            # Winner Logic
             past_wins = hist_winners[hist_winners.index < today]
             if past_wins.empty: continue
-            
             target_risky = past_wins.iloc[-1]
-            
-            # 檢核 target_risky 是否有效 (防止 NaN 導致 KeyError)
-            if pd.isna(target_risky) or target_risky not in MAPPING:
-                continue
+            if pd.isna(target_risky) or target_risky not in MAPPING: continue
 
-            # 決定權重
+            # Weight Logic
             if target_risky in risk_data and today in risk_data[target_risky].index:
                 w_risk = risk_data[target_risky].loc[today, 'Weight']
             else:
                 w_risk = 0.0 
-                
             w_safe = 1.0 - w_risk
             
-            # 決定避險標的
+            # Safe Asset Logic
             target_safe = hist_safe.loc[today]
-            if pd.isna(target_safe): target_safe = 'TLT' # 防呆
+            if pd.isna(target_safe): target_safe = 'TLT' 
             
-            # 建構倉位
+            # Cost Logic
             curr_pos = {}
             if w_risk > 0: curr_pos[target_risky] = w_risk
             if w_safe > 0: curr_pos[target_safe] = w_safe
             
-            # 統計 (使用 defaultdict 安全累加)
-            hold_counts[target_risky] += w_risk
-            hold_counts[target_safe] += w_safe
-            
-            # 計算成本
             cost = 0.0
             all_assets = set(list(prev_pos.keys()) + list(curr_pos.keys()))
             for asset in all_assets:
@@ -408,13 +412,12 @@ if st.button("🚀 開始執行回測"):
                 if w_prev != w_curr:
                     cost += abs(w_curr - w_prev) * TRANSACTION_COST
             
-            # 計算報酬
+            # Return Logic
             day_ret = 0.0
             if w_risk > 0:
                 r = data[target_risky].pct_change().iloc[i]
                 if np.isnan(r): r=0
                 day_ret += w_risk * r
-            
             if w_safe > 0:
                 r = data[target_safe].pct_change().iloc[i]
                 if np.isnan(r): r=0
@@ -422,6 +425,8 @@ if st.button("🚀 開始執行回測"):
                 
             strategy_ret.append(day_ret - cost)
             valid_dates.append(today)
+            hold_counts[target_risky] += w_risk
+            hold_counts[target_safe] += w_safe
             prev_pos = curr_pos
             
         progress_bar.empty()
@@ -431,82 +436,119 @@ if st.button("🚀 開始執行回測"):
         cum_eq = (1 + eq).cumprod()
         dd = cum_eq / cum_eq.cummax() - 1
         
-        # Benchmark (VT)
-        if 'VT' not in data.columns:
-            bench_ret = data['SPY'].loc[valid_dates].pct_change().fillna(0)
-        else:
-            bench_ret = data['VT'].loc[valid_dates].pct_change().fillna(0)
-        bench_eq = (1 + bench_ret).cumprod()
+        # Benchmark: UPRO+EURL+EDC Equal Weight Quarterly Rebalance
+        bench_subset = data[list(MAPPING.keys())].loc[valid_dates].copy()
         
-        # 指標計算
-        days = (cum_eq.index[-1] - cum_eq.index[0]).days
-        years = days / 365.25
-        cagr = (cum_eq.iloc[-1] / cum_eq.iloc[0]) ** (1/years) - 1
-        mdd = dd.min()
+        # 構建季末再平衡權益曲線
+        b_equity_series = pd.Series(1.0, index=bench_subset.index)
+        current_capital = 1.0
         
-        neg_ret = eq[eq < 0]
-        down_std = neg_ret.std() * np.sqrt(252)
-        sortino = (cagr - RF_RATE) / (down_std + 1e-6)
+        # 找出季末節點 (包含起始日與結束日)
+        # 使用 groupby 來確保找出每個 Quarter 最後一個"交易日"
+        quarter_ends = bench_subset.groupby(pd.Grouper(freq='QE')).apply(lambda x: x.index[-1] if len(x)>0 else None).dropna()
+        check_points = sorted(list(set([bench_subset.index[0]] + list(quarter_ends) + [bench_subset.index[-1]])))
         
-        roll_5y = cum_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260) - 1).mean()
+        for i in range(len(check_points)-1):
+            t_start = check_points[i]
+            t_end = check_points[i+1]
+            
+            # 取出區間 (避免空區間)
+            if t_start >= t_end: continue
+            
+            # loc 是包含邊界的，但為了計算正確回報，我們需要 t_start 的價格作為基期
+            segment = bench_subset.loc[t_start:t_end]
+            if len(segment) < 2: continue
+            
+            # 歸一化：以該段起點為基數 1.0
+            # 假設起點再平衡，權重重置為 1/3
+            rel_price = segment.div(segment.iloc[0])
+            segment_val = rel_price.mean(axis=1) * current_capital
+            
+            b_equity_series.loc[t_start:t_end] = segment_val
+            current_capital = segment_val.iloc[-1]
+            
+        bench_eq = b_equity_series
+        bench_ret = bench_eq.pct_change().fillna(0)
+        bench_dd = bench_eq / bench_eq.cummax() - 1
         
-        # Time in Market (3x 資產)
+        # Metrics Calculation Helper
+        def calc_stats(equity, daily_r):
+            if len(equity) < 1: return 0,0,0,0,0
+            d = (equity.index[-1] - equity.index[0]).days
+            y = d / 365.25
+            cagr = (equity.iloc[-1] / equity.iloc[0]) ** (1/y) - 1
+            mdd = (equity / equity.cummax() - 1).min()
+            neg = daily_r[daily_r < 0]
+            down_std = neg.std() * np.sqrt(252)
+            sortino = (cagr - RF_RATE) / (down_std + 1e-6)
+            roll5 = equity.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260) - 1).mean()
+            return cagr, sortino, roll5, mdd
+
+        s_cagr, s_sort, s_roll, s_mdd = calc_stats(cum_eq, eq)
+        b_cagr, b_sort, b_roll, b_mdd = calc_stats(bench_eq, bench_ret)
+        
+        # Time in Market (3x Assets)
         total_d = len(valid_dates)
         time_in_mkt = (hold_counts['UPRO'] + hold_counts['EURL'] + hold_counts['EDC']) / total_d
         
-        # 佔比
+        # Alloc String
         alloc_str = ""
         for k, v in hold_counts.items():
             pct = v / total_d
             if pct > 0.01: alloc_str += f"{k}:{pct:.0%} "
             
-        # --- C. 顯示結果 ---
+        # --- C. 顯示結果 (Metric Box with CSS) ---
         st.write("### 📈 回測績效指標")
         m1, m2, m3, m4, m5 = st.columns(5)
         
-        def metric_box(label, value, fmt="{:.2%}"):
+        def metric_box(label, value, bench_val=None, fmt="{:.2%}"):
+            bench_str = f"(Bench: {fmt.format(bench_val)})" if bench_val is not None else ""
             st.markdown(f"""
-            <div style="background-color: #f0f2f6; padding: 10px; border-radius: 5px; text-align: center;">
-                <p style="margin:0; font-size: 14px; color: #555;">{label}</p>
-                <p style="margin:0; font-size: 20px; font-weight: bold;">{fmt.format(value)}</p>
+            <div class="metric-card">
+                <p class="metric-label">{label}</p>
+                <p class="metric-value">{fmt.format(value)}</p>
+                <p class="metric-sub">{bench_str}</p>
             </div>
             """, unsafe_allow_html=True)
 
-        with m1: metric_box("CAGR", cagr)
-        with m2: metric_box("Sortino", sortino, "{:.2f}")
-        with m3: metric_box("Avg 5Y Roll", roll_5y)
-        with m4: metric_box("Max DD", mdd)
-        with m5: metric_box("Time in 3x", time_in_mkt)
+        with m1: metric_box("CAGR", s_cagr, b_cagr)
+        with m2: metric_box("Sortino", s_sort, b_sort, "{:.2f}")
+        with m3: metric_box("Avg 5Y Roll", s_roll, b_roll)
+        with m4: metric_box("Max DD", s_mdd, b_mdd)
+        with m5: metric_box("Time in 3x", time_in_mkt, None) 
         
         st.markdown(f"**資產分佈 (時間加權):** {alloc_str}")
         
-        # Altair Charts
+        # 2. Altair 圖表 (含 Benchmark)
         st.write("### 📊 權益曲線與回撤")
         
         df_chart = pd.DataFrame({
             'Date': cum_eq.index,
             'Strategy': cum_eq - 1,
-            'Benchmark': bench_eq - 1
+            'Benchmark (EqW Qtly)': bench_eq - 1
         }).melt('Date', var_name='Asset', value_name='Return')
         
         chart = alt.Chart(df_chart).mark_line().encode(
             x='Date',
             y=alt.Y('Return', axis=alt.Axis(format='%')),
-            color=alt.Color('Asset', scale=alt.Scale(range=['#1f77b4', '#999999'])),
+            color=alt.Color('Asset', scale=alt.Scale(domain=['Strategy', 'Benchmark (EqW Qtly)'], range=['#1f77b4', '#999999'])),
             tooltip=['Date', 'Asset', alt.Tooltip('Return', format='.2%')]
         ).properties(height=400, title="累積報酬率 (Cumulative Return)")
         
         st.altair_chart(chart, use_container_width=True)
         
+        # Drawdown Chart
         df_dd_chart = pd.DataFrame({
             'Date': cum_eq.index,
-            'Drawdown': dd
-        })
+            'Strategy': dd,
+            'Benchmark (EqW Qtly)': bench_dd
+        }).melt('Date', var_name='Asset', value_name='Drawdown')
         
-        chart_dd = alt.Chart(df_dd_chart).mark_area(color='#ff7f0e', opacity=0.5).encode(
+        chart_dd = alt.Chart(df_dd_chart).mark_line().encode(
             x='Date',
             y=alt.Y('Drawdown', axis=alt.Axis(format='%')),
-            tooltip=['Date', alt.Tooltip('Drawdown', format='.2%')]
+            color=alt.Color('Asset', scale=alt.Scale(domain=['Strategy', 'Benchmark (EqW Qtly)'], range=['#ff7f0e', '#999999'])),
+            tooltip=['Date', 'Asset', alt.Tooltip('Drawdown', format='.2%')]
         ).properties(height=200, title="回撤 (Drawdown)")
         
         st.altair_chart(chart_dd, use_container_width=True)
