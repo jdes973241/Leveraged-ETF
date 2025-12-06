@@ -256,25 +256,3 @@ elif 'equity' in st.session_state:
     m1, m2 = st.columns(2)
     m1.metric("CAGR", f"{cagr*100:.2f}%")
     m2.metric("Total Return", f"{(equity.iloc[-1]-1)*100:.2f}%")
-
-### 第三部分：部署指南
-
-1.  **儲存檔案**：將上述程式碼儲存為 `app_local_only.py`。
-2.  **上傳至 GitHub**：建立一個新的 GitHub 倉庫，並上傳 `app_local_only.py` 和 `requirements.txt` 檔案。
-    * `requirements.txt` 內容如下：
-        ```txt
-        streamlit
-        yfinance
-        pandas
-        numpy
-        plotly
-        arch
-        tqdm
-        ```
-3.  **部署至 Streamlit Cloud**：
-    * 登入 Streamlit Cloud。
-    * 點擊 "New App"。
-    * 連結到您的 GitHub 倉庫，選擇 `main` 分支，並指定主檔案為 `app_local_only.py`。
-    * 點擊 **Deploy**。
-
-**建議**：由於 GARCH 訓練非常耗時，您可以在 Streamlit Cloud 上部署一個**已事先計算好訊號**的版本，或者接受第一次載入需要較長時間的設定。
