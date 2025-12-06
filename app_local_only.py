@@ -11,7 +11,7 @@ import warnings
 # ==========================================
 # 0. 頁面設定與參數
 # ==========================================
-st.set_page_config(page_title="Dynamic Momentum Strategy (Whitepaper)", layout="wide")
+st.set_page_config(page_title="Dynamic Momentum Strategy (Final)", layout="wide")
 warnings.simplefilter(action='ignore')
 
 # CSS 美化
@@ -47,9 +47,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# === 核心參數 (依照白皮書設定) ===
+# === 核心參數 ===
 MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"} # 3x -> 1x
-SAFE_POOL = ["GLD", "TLT"] # 避險資產
+SAFE_POOL = ["GLD", "TLT"] 
 
 # 統一動態分位數: Exit Q74 / Entry Q59
 RISK_CONFIG = {
@@ -65,9 +65,7 @@ TRANSACTION_COST = 0.001
 RF_RATE = 0.04 
 
 # === 合成數據參數 (回測專用) ===
-# 用於模擬 2005-2010 年的 3x 表現
 LEVERAGE_RATIO = 3.0
-# 動態損耗函數
 def get_daily_leverage_cost(date):
     year = date.year
     if year <= 2007 or year >= 2022: return 0.05 / 252 
@@ -140,7 +138,6 @@ def calculate_selection_metrics(data):
     prices = data[list(MAPPING.keys())]
     
     metrics = []
-    latest_date = prices.index[-1]
     
     for ticker in prices.columns:
         row = {'Ticker': ticker}
@@ -177,7 +174,6 @@ def calculate_selection_metrics(data):
 
 @st.cache_data(ttl=3600)
 def get_safe_asset_status(data):
-    """白皮書邏輯：比較 GLD 與 TLT 過去 12 個月報酬，選高者"""
     if data.empty: return "TLT", {}
     
     p_now = data[SAFE_POOL].iloc[-1]
@@ -204,8 +200,8 @@ def get_safe_asset_status(data):
 
 @st.cache_data(ttl=3600, show_spinner="生成合成數據中...")
 def get_synthetic_backtest_data():
-    """下載 1x 原型並生成合成 3x 數據，以涵蓋 2008 年"""
-    tickers = list(MAPPING.values()) + SAFE_POOL # 只下載 1x
+    """下載 1x 原型並生成合成 3x 數據 + VT"""
+    tickers = list(MAPPING.values()) + SAFE_POOL + ['VT'] # 新增 VT
     try:
         data_1x = yf.download(tickers, period="max", interval="1d", auto_adjust=True, progress=False)
         if isinstance(data_1x.columns, pd.MultiIndex):
@@ -215,76 +211,28 @@ def get_synthetic_backtest_data():
         data_1x = data_1x.ffill().dropna()
         synthetic_data = pd.DataFrame(index=data_1x.index)
         
-        # 複製避險資產
-        for t in SAFE_POOL:
-            synthetic_data[t] = data_1x[t]
+        # 複製避險資產 與 VT
+        for t in SAFE_POOL + ['VT']:
+            if t in data_1x.columns:
+                synthetic_data[t] = data_1x[t]
             
         # 生成合成 3x 數據
-        # 為了變數名稱統一，這裡將合成數據命名為 UPRO, EURL, EDC
-        # 同時保留 1x 數據供 GARCH 使用，命名為 RAW_UPRO ...
-        
-        # Mapping 1x to 3x Name
-        REVERSE_MAP = {v: k for k, v in MAPPING.items()} # SPY -> UPRO
+        REVERSE_MAP = {v: k for k, v in MAPPING.items()} 
         
         for ticker_1x in MAPPING.values():
             ticker_3x = REVERSE_MAP[ticker_1x]
-            
             ret_1x = data_1x[ticker_1x].pct_change().fillna(0)
             costs = pd.Series([get_daily_leverage_cost(d) for d in ret_1x.index], index=ret_1x.index)
             ret_3x = (ret_1x * 3.0) - costs
-            
             syn_price = (1 + ret_3x).cumprod() * 100
             
             synthetic_data[ticker_3x] = syn_price
-            synthetic_data[f"RAW_{ticker_3x}"] = data_1x[ticker_1x] # 保留原型
+            synthetic_data[f"RAW_{ticker_3x}"] = data_1x[ticker_1x] 
             
-        return synthetic_data
+        return synthetic_data.dropna()
         
     except Exception as e:
         return pd.DataFrame()
-
-@st.cache_data(ttl=3600, show_spinner="計算歷史風控訊號...")
-def calculate_historical_risk_signals(data):
-    """針對合成數據計算 GARCH 訊號"""
-    if data.empty: return {}
-    risk_weights = pd.DataFrame(index=data.index, columns=MAPPING.keys())
-    
-    # 這裡使用簡單迴圈，不顯示進度條以避免 Streamlit 報錯
-    for ticker_3x in MAPPING.keys():
-        col_1x = f"RAW_{ticker_3x}"
-        if col_1x not in data.columns: continue
-        
-        series = data[col_1x]
-        ret = series.pct_change() * 100
-        sma = series.rolling(SMA_WINDOW).mean()
-        
-        window = ret.dropna()
-        if len(window) < 100: continue
-        
-        try:
-            # 全區間擬合加速
-            am = arch_model(window, vol='Garch', p=1, q=1, dist='t', rescale=False)
-            res = am.fit(disp='off', show_warning=False)
-            cond_vol = res.conditional_volatility * np.sqrt(252)
-            
-            df = pd.DataFrame({'Vol': cond_vol, 'Price': series, 'SMA': sma})
-            cfg = RISK_CONFIG[ticker_3x]
-            
-            df['Exit_Th'] = df['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
-            df['Entry_Th'] = df['Vol'].rolling(252).quantile(cfg['entry_q']).shift(1)
-            
-            g_sig = pd.Series(np.nan, index=df.index)
-            valid = df['Exit_Th'].notna()
-            g_sig.loc[valid & (df['Vol'] > df['Exit_Th'])] = 0.0
-            g_sig.loc[valid & (df['Vol'] < df['Entry_Th'])] = 1.0
-            g_sig = g_sig.ffill().fillna(0.0)
-            
-            sma_sig = (df['Price'] > df['SMA']).astype(float)
-            risk_weights[ticker_3x] = (0.5 * g_sig) + (0.5 * sma_sig)
-            
-        except: continue
-        
-    return risk_weights.dropna()
 
 # ==========================================
 # 3. 應用程式主邏輯
@@ -316,8 +264,30 @@ final_weight = latest_risk_row['Weight']
 # 4. Dashboard 前端顯示
 # ==========================================
 
-st.title("🛡️ 雙重動能與動態風控策略 (Whitepaper Ver.)")
-st.caption(f"數據基準日: {latest_date.strftime('%Y-%m-%d')} | 參數: 統一 Q74/Q59")
+st.title("🛡️ 雙重動能與動態風控策略")
+st.caption(f"數據基準日: {latest_date.strftime('%Y-%m-%d')}")
+
+# --- 白皮書區塊 ---
+with st.expander("📖 策略白皮書 (Strategy Whitepaper)", expanded=False):
+    st.markdown("""
+    ### 策略邏輯摘要
+    本策略採用 **訊號與執行分離 (Decoupled Signal)** 架構，利用 1x 原型預測風險，操作 3x 槓桿獲利。
+    
+    #### 1. 選股引擎 (Selection Engine)
+    * **對象**: UPRO, EURL, EDC (3x 槓桿)。
+    * **邏輯**: 計算 3M, 6M, 9M, 12M 的 **風險調整後報酬 (Return/Vol)**，並進行 **Z-Score** 排序。
+    * **決策**: 選出總分最高的標的作為本月 Winner。
+    
+    #### 2. 風控引擎 (Risk Engine)
+    * **對象**: SPY, VGK, EEM (1x 原型)。
+    * **A 軌 (GARCH)**: 每日滾動預測波動率。若 `Vol > Exit(Q74)` 避險；若 `Vol < Entry(Q59)` 持有。
+    * **B 軌 (SMA)**: 若價格 > 200MA 持有；否則避險。
+    * **權重**: 0.5 * GARCH + 0.5 * SMA。
+    
+    #### 3. 避險輪動 (Safe Asset Rotation)
+    * 當風控建議空倉時，資金停泊於 **GLD (黃金)** 或 **TLT (美債)**。
+    * **規則**: 比較兩者過去 12 個月績效，持有較強者。
+    """)
 
 # --- Top Summary ---
 c1, c2, c3, c4 = st.columns(4)
@@ -356,8 +326,8 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 ])
 
 with tab1:
-    st.caption("最新市場價格")
-    cols = list(MAPPING.keys()) + SAFE_POOL
+    st.caption("最新市場價格 (含 1x 原型)")
+    cols = list(MAPPING.keys()) + list(MAPPING.values()) + SAFE_POOL
     st.dataframe(data[cols].tail(5).sort_index(ascending=False).style.format("{:.2f}"), use_container_width=True)
 
 with tab2:
@@ -392,14 +362,11 @@ with tab4:
 
 with tab5:
     st.caption("避險資產輪動 (Safe Asset Rotation)")
-    st.info("規則：若需要避險，則持有 GLD 與 TLT 中過去 12 個月報酬較高者。")
     safe_display = safe_details_df.copy()
     safe_display['Selected'] = safe_display.index.map(lambda x: '✅' if x == safe_winner else '')
     st.dataframe(
         safe_display.style.format({
-            "Current Price": "{:.2f}",
-            "12M Ago Price": "{:.2f}",
-            "12M Return": "{:.2%}"
+            "Current Price": "{:.2f}", "12M Ago Price": "{:.2f}", "12M Return": "{:.2%}"
         }).map(lambda x: 'color: green' if x == '✅' else '', subset=['Selected']),
         use_container_width=True
     )
@@ -424,33 +391,25 @@ st.header("⏳ 歷史回測分析 (Synthetic)")
 syn_data = get_synthetic_backtest_data()
 
 if syn_data.empty:
-    st.warning("合成數據生成失敗，無法進行回測。")
+    st.warning("合成數據生成失敗。")
 else:
-    # 扣除暖機期
-    # GARCH Window = 1260 (5年) + 動能 252 (1年) = 1512
-    # 實際上因為數據源是 2005 開始，這樣會切掉 2008
-    # 為了讓回測包含 2008，我們這裡特別縮短 GARCH 暖機為 504 (2年) 僅供回測展示
+    # 暖機期設定
+    # 為了展示 2008 年數據，我們使用較短的 GARCH 窗口進行回測演示
+    # 若要嚴格符合 5 年窗口，數據會從 2010 開始
     BACKTEST_GARCH_WINDOW = 504 
     est_start_date = syn_data.index[0] + timedelta(days=(BACKTEST_GARCH_WINDOW + 252) * 1.45) 
     start_date_str = est_start_date.strftime('%Y-%m-%d')
 
     st.caption(f"""
     設定說明：
-    - **數據源**：合成數據 (1x 原型模擬 3x，含動態損耗)
-    - **回測起點**：約 {start_date_str} (數據最早可追溯至 2005，保留 3 年暖機期)
-    - **基準 (Benchmark)**：UPRO + EURL + EDC (合成 3x / 每季等權重)
+    - **回測起點**：約 {start_date_str} (數據源含 2008 海嘯)
+    - **比較基準 1**：UPRO + EURL + EDC (合成 3x / 每季等權重)
+    - **比較基準 2**：VT (Vanguard Total World Stock ETF)
     """)
 
     if st.button("🚀 開始執行回測 (Synthetic)"):
         with st.spinner("正在進行歷史運算..."):
-            # 1. 計算歷史風控權重 (使用縮短的 window 以最大化長度)
-            # 這裡我們需要重新寫一個簡單的計算函數，因為參數不同
-            
-            # (簡化) 直接使用 calculate_historical_risk_signals 計算
-            # 注意：該函數內的 Window 需改為 BACKTEST_GARCH_WINDOW
-            # 為了不破壞原有結構，我們直接在這裡實作回測邏輯
-            
-            # --- 重算歷史訊號 (Quick Calc) ---
+            # 1. 計算歷史風控權重
             h_risk_weights = pd.DataFrame(index=syn_data.index, columns=MAPPING.keys())
             
             for ticker_3x in MAPPING.keys():
@@ -460,7 +419,6 @@ else:
                 r = s.pct_change() * 100
                 sma = s.rolling(SMA_WINDOW).mean()
                 
-                # GARCH (Full History Fit)
                 win = r.dropna()
                 am = arch_model(win, vol='Garch', p=1, q=1, dist='t', rescale=False)
                 res = am.fit(disp='off', show_warning=False)
@@ -495,9 +453,7 @@ else:
             
             # 4. 逐日回測
             dates = syn_data.index
-            # 確保跳過暖機期 (GARCH + Quantile + Mom)
-            # 約 252 * 2 = 504
-            start_idx = 504 
+            start_idx = 504 + 252 
             
             strategy_ret = []
             valid_dates = []
@@ -522,7 +478,6 @@ else:
                 target_safe = hist_safe.loc[today]
                 if pd.isna(target_safe): target_safe = 'TLT'
                 
-                # Cost
                 curr_pos = {}
                 if w_risk > 0: curr_pos[target_risky] = w_risk
                 if w_safe > 0: curr_pos[target_safe] = w_safe
@@ -535,7 +490,6 @@ else:
                     if w_prev != w_curr:
                         cost += abs(w_curr - w_prev) * TRANSACTION_COST
                 
-                # Return
                 day_ret = 0.0
                 if w_risk > 0:
                     r = syn_data[target_risky].pct_change().iloc[i]
@@ -559,7 +513,7 @@ else:
             cum_eq = (1 + eq).cumprod()
             dd = cum_eq / cum_eq.cummax() - 1
             
-            # Benchmark (Qtly EqW)
+            # Benchmark 1: Syn 3x EqW (Quarterly)
             b_subset = syn_data[list(MAPPING.keys())].loc[valid_dates].copy()
             b_equity_series = pd.Series(1.0, index=b_subset.index)
             curr_cap = 1.0
@@ -576,26 +530,29 @@ else:
                 val = rel.mean(axis=1) * curr_cap
                 b_equity_series.loc[t_s:t_e] = val
                 curr_cap = val.iloc[-1]
-                
-            bench_eq = b_equity_series
-            bench_dd = bench_eq / bench_eq.cummax() - 1
             
-            # Stats
+            # Benchmark 2: VT (Buy & Hold)
+            if 'VT' in syn_data.columns:
+                vt_ret = syn_data['VT'].loc[valid_dates].pct_change().fillna(0)
+                vt_eq = (1 + vt_ret).cumprod()
+            else:
+                vt_eq = pd.Series(1.0, index=valid_dates) # Fallback
+            
+            # Stats Helper
             def calc_stats(equity, daily_r):
-                if len(equity) < 1: return 0,0,0,0,0
+                if len(equity) < 1: return 0,0,0,0
                 d = (equity.index[-1] - equity.index[0]).days
                 y = d / 365.25
                 cagr = (equity.iloc[-1] / equity.iloc[0]) ** (1/y) - 1
                 mdd = (equity / equity.cummax() - 1).min()
                 neg = daily_r[daily_r < 0]
-                down_std = neg.std() * np.sqrt(252)
-                sortino = (cagr - RF_RATE) / (down_std + 1e-6)
+                sortino = (cagr - RF_RATE) / (neg.std() * np.sqrt(252) + 1e-6)
                 roll5 = equity.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260) - 1).mean()
                 return cagr, sortino, roll5, mdd
 
             s_cagr, s_sort, s_roll, s_mdd = calc_stats(cum_eq, eq)
-            bench_ret = bench_eq.pct_change().fillna(0)
-            b_cagr, b_sort, b_roll, b_mdd = calc_stats(bench_eq, bench_ret)
+            b3_cagr, b3_sort, b3_roll, b3_mdd = calc_stats(b_equity_series, b_equity_series.pct_change().fillna(0))
+            vt_cagr, vt_sort, vt_roll, vt_mdd = calc_stats(vt_eq, vt_eq.pct_change().fillna(0))
             
             total_d = len(valid_dates)
             time_in_mkt = (hold_counts['UPRO'] + hold_counts['EURL'] + hold_counts['EDC']) / total_d
@@ -609,21 +566,24 @@ else:
             st.write("### 📈 回測績效指標")
             m1, m2, m3, m4, m5 = st.columns(5)
             
-            def metric_box(label, value, bench_val=None, fmt="{:.2%}"):
-                bench_str = f"(Bench: {fmt.format(bench_val)})" if bench_val is not None else ""
+            def metric_box(label, value, b3_val=None, vt_val=None, fmt="{:.2%}"):
+                b3_str = f"3x: {fmt.format(b3_val)}" if b3_val is not None else ""
+                vt_str = f"VT: {fmt.format(vt_val)}" if vt_val is not None else ""
+                sub_str = f"{b3_str} | {vt_str}"
+                
                 st.markdown(f"""
                 <div class="metric-card">
                     <p class="metric-label">{label}</p>
                     <p class="metric-value">{fmt.format(value)}</p>
-                    <p class="metric-sub">{bench_str}</p>
+                    <p class="metric-sub">{sub_str}</p>
                 </div>
                 """, unsafe_allow_html=True)
 
-            with m1: metric_box("CAGR", s_cagr, b_cagr)
-            with m2: metric_box("Sortino", s_sort, b_sort, "{:.2f}")
-            with m3: metric_box("Avg 5Y Roll", s_roll, b_roll)
-            with m4: metric_box("Max DD", s_mdd, b_mdd)
-            with m5: metric_box("Time in 3x", time_in_mkt, None) 
+            with m1: metric_box("CAGR", s_cagr, b3_cagr, vt_cagr)
+            with m2: metric_box("Sortino", s_sort, b3_sort, vt_sort, "{:.2f}")
+            with m3: metric_box("Avg 5Y Roll", s_roll, b3_roll, vt_roll)
+            with m4: metric_box("Max DD", s_mdd, b3_mdd, vt_mdd)
+            with m5: metric_box("Time in 3x", time_in_mkt, None, None) 
             
             st.markdown(f"**資產分佈 (時間加權):** {alloc_str}")
             
@@ -633,29 +593,31 @@ else:
             df_chart = pd.DataFrame({
                 'Date': cum_eq.index,
                 'Strategy': cum_eq - 1,
-                'Benchmark (EqW Qtly)': bench_eq - 1
+                'Bench (3x EqW)': b_equity_series - 1,
+                'Bench (VT)': vt_eq - 1
             }).melt('Date', var_name='Asset', value_name='Return')
             
             chart = alt.Chart(df_chart).mark_line().encode(
                 x='Date',
                 y=alt.Y('Return', axis=alt.Axis(format='%')),
-                color=alt.Color('Asset', scale=alt.Scale(domain=['Strategy', 'Benchmark (EqW Qtly)'], range=['#1f77b4', '#999999'])),
+                color=alt.Color('Asset', scale=alt.Scale(domain=['Strategy', 'Bench (3x EqW)', 'Bench (VT)'], range=['#1f77b4', '#999999', '#2ca02c'])),
                 tooltip=['Date', 'Asset', alt.Tooltip('Return', format='.2%')]
-            ).properties(height=400, title="累積報酬率 (Cumulative Return)")
+            ).properties(height=400, title="累積報酬率 (Cumulative Return)").interactive()
             
             st.altair_chart(chart, use_container_width=True)
             
             df_dd_chart = pd.DataFrame({
                 'Date': cum_eq.index,
                 'Strategy': dd,
-                'Benchmark (EqW Qtly)': bench_dd
+                'Bench (3x EqW)': b_equity_series / b_equity_series.cummax() - 1,
+                'Bench (VT)': vt_eq / vt_eq.cummax() - 1
             }).melt('Date', var_name='Asset', value_name='Drawdown')
             
             chart_dd = alt.Chart(df_dd_chart).mark_line().encode(
                 x='Date',
                 y=alt.Y('Drawdown', axis=alt.Axis(format='%')),
-                color=alt.Color('Asset', scale=alt.Scale(domain=['Strategy', 'Benchmark (EqW Qtly)'], range=['#ff7f0e', '#999999'])),
+                color=alt.Color('Asset', scale=alt.Scale(domain=['Strategy', 'Bench (3x EqW)', 'Bench (VT)'], range=['#ff7f0e', '#999999', '#2ca02c'])),
                 tooltip=['Date', 'Asset', alt.Tooltip('Drawdown', format='.2%')]
-            ).properties(height=200, title="回撤 (Drawdown)")
+            ).properties(height=200, title="回撤 (Drawdown)").interactive()
             
             st.altair_chart(chart_dd, use_container_width=True)
