@@ -554,7 +554,13 @@ else:
                 cagr = (equity.iloc[-1] / equity.iloc[0]) ** (1/y) - 1
                 mdd = (equity / equity.cummax() - 1).min()
                 neg = daily_r[daily_r < 0]
-                sortino = (cagr - RF_RATE) / (neg.std() * np.sqrt(252) + 1e-6)
+                # [修正] 符合學術定義的 Sortino 計算
+                downside_returns = daily_r.copy()
+                downside_returns[downside_returns > 0] = 0
+                # 計算下行波動 (Root Mean Square of downside returns)
+                down_std = np.sqrt((downside_returns**2).mean()) * np.sqrt(252)
+    
+                sortino = (cagr - RF_RATE) / (down_std + 1e-6)
                 roll5 = equity.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260) - 1).mean()
                 return cagr, sortino, roll5, mdd
 
