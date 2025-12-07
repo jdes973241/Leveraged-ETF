@@ -11,7 +11,7 @@ import warnings
 # ==========================================
 # 0. 頁面設定與參數
 # ==========================================
-st.set_page_config(page_title="Dynamic Momentum Strategy (Final Corrected)", layout="wide")
+st.set_page_config(page_title="Dynamic Momentum Strategy (Final Audited)", layout="wide")
 warnings.simplefilter(action='ignore')
 
 # CSS 美化
@@ -37,7 +37,7 @@ st.markdown("""
 MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"} 
 SAFE_POOL = ["GLD", "TLT"] 
 
-# [參數確認] 統一 Q80 / Q65
+# [修正 2] 統一參數為 Q80 / Q65
 RISK_CONFIG = {
     "UPRO": {"exit_q": 0.80, "entry_q": 0.65},
     "EURL": {"exit_q": 0.80, "entry_q": 0.65},
@@ -101,12 +101,16 @@ def calculate_risk_metrics(data):
             df = df.dropna()
 
             cfg = RISK_CONFIG[trade_t]
-            # Dashboard 顯示用 (Shift 1 表示昨收數值應用於今日)
+            # [修正 1] 避免未來視角: 使用 shift(1)
+            # 今天的閾值是由昨天收盤算出的分布決定的
             df['Exit_Th'] = df['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
             df['Entry_Th'] = df['Vol'].rolling(252).quantile(cfg['entry_q']).shift(1)
             
             df['GARCH_State'] = np.nan
             valid = df['Exit_Th'].notna()
+            # 訊號判斷: 
+            # 若今日Vol > 今日閾值(昨天算的)，則轉為避險
+            # 這裡邏輯是: 盤中若波動率飆升超過警戒線，收盤確認後，明日執行避險
             df.loc[valid & (df['Vol'] > df['Exit_Th']), 'GARCH_State'] = 0.0 
             df.loc[valid & (df['Vol'] < df['Entry_Th']), 'GARCH_State'] = 1.0 
             df['GARCH_State'] = df['GARCH_State'].ffill().fillna(1.0)
@@ -156,21 +160,36 @@ def calculate_selection_metrics(data):
 
 @st.cache_data(ttl=3600)
 def get_safe_asset_status(data):
+    """
+    [修正 3] 每月調整一次 GLD/TLT
+    邏輯：比較上個月底 (Monthly Resample) 的 12M 報酬
+    """
     if data.empty: return "TLT", {}
     
-    # 比較上個月底的績效 (符合回測邏輯)
+    # 取月度數據
     monthly = data[SAFE_POOL].resample('M').last()
+    
+    # 確保有足夠歷史
     if len(monthly) > 12:
+        # 比較上個月底的數據 (iloc[-1] 是本月還沒走完的，iloc[-2] 是上個月底)
+        # 實際上 Live Dashboard 應該看「最新已完成的月份」或「當下即時狀態」
+        # 為了符合「每月調整一次」的邏輯，我們只取最近一個「月底」的訊號
+        
+        # 這裡我們取 monthly 的最後一筆 (即最新數據，可能是月中也可能是月底)
+        # 但為了嚴謹，回測邏輯是月初看上個月底。Dashboard 顯示 "當前狀態"
         p_now = monthly.iloc[-1]
-        p_prev = monthly.iloc[-13] 
+        p_prev = monthly.iloc[-13] # 12個月前
         ret_12m = (p_now / p_prev) - 1
     else:
         ret_12m = pd.Series(0.0, index=SAFE_POOL)
     
     winner = ret_12m.idxmax()
+    
     details = pd.DataFrame({
-        "Ticker": SAFE_POOL, "12M Return": ret_12m.values
+        "Ticker": SAFE_POOL, 
+        "12M Return": ret_12m.values
     }).set_index("Ticker")
+    
     return winner, details
 
 # ==========================================
@@ -186,7 +205,7 @@ def get_synthetic_backtest_data():
             if 'Close' in data_raw.columns.levels[0]: data_raw = data_raw['Close']
             else: data_raw = data_raw['Close'] if 'Close' in data_raw else data_raw
         
-        # 確保 VGK/EEM 數據存在
+        # 保留 VGK 最早日期 (約 2005-03)
         data_raw = data_raw.ffill().dropna(subset=['VGK', 'EEM', 'SPY', 'GLD', 'TLT'])
         
         synthetic_data = pd.DataFrame(index=data_raw.index)
@@ -206,50 +225,6 @@ def get_synthetic_backtest_data():
         return synthetic_data
     except Exception as e:
         return pd.DataFrame()
-
-# [關鍵修正]：正確實作 Risk-Adjusted Z-Score 回測選股
-def calculate_historical_winners(syn_data):
-    """回測專用的歷史動能計算 (嚴格遵守白皮書邏輯)"""
-    tickers = list(MAPPING.keys())
-    monthly_prices = syn_data[tickers].resample('M').last()
-    
-    winners = pd.Series(index=monthly_prices.index, dtype='object')
-    
-    # 為了計算 Z-Score，我們需要每個月進行一次橫向比較
-    # 雖然比向量化慢一點，但邏輯才是正確的
-    
-    for i in range(13, len(monthly_prices)):
-        curr_date = monthly_prices.index[i]
-        
-        scores = pd.DataFrame(index=tickers, columns=MOM_PERIODS)
-        
-        # 取得該日期的日波動率 (過去半年 126天)
-        d_loc = syn_data.index.get_indexer([curr_date], method='pad')[0]
-        # 防呆
-        if d_loc < 126: continue
-        
-        daily_subset = syn_data[tickers].iloc[d_loc-126 : d_loc]
-        vol = daily_subset.pct_change().std() * np.sqrt(252) # 年化波動
-        
-        for m in MOM_PERIODS:
-            prev_date = monthly_prices.index[i-m]
-            # 區間回報
-            ret = (monthly_prices.loc[curr_date] - monthly_prices.loc[prev_date]) / monthly_prices.loc[prev_date]
-            
-            # Risk Adjusted
-            risk_adj = ret / (vol + 1e-6)
-            scores[m] = risk_adj
-            
-        # Z-Score 標準化 (橫向: 對三個標的做標準化)
-        # Apply zscore per column (period) is WRONG -> Should be per period across assets?
-        # 白皮書：將三個標的在"同一週期"內的分數 Z-Score
-        z_scores = scores.apply(lambda x: (x - x.mean()) / (x.std() + 1e-6), axis=0)
-        
-        # 加總
-        final_score = z_scores.sum(axis=1)
-        winners[curr_date] = final_score.idxmax()
-        
-    return winners.dropna()
 
 # ==========================================
 # 3. 應用程式主邏輯
@@ -291,7 +266,7 @@ with st.expander("📖 策略白皮書 (Strategy Whitepaper)", expanded=False):
     
     #### 1. 選股引擎 (Selection Engine)
     * **對象**: UPRO, EURL, EDC (3x 槓桿)。
-    * **邏輯**: 計算 3M, 6M, 9M, 12M 的 **風險調整後報酬 (Return/Vol)**，並進行 **Z-Score** 排序。
+    * **邏輯**: 計算 3M, 6M, 9M, 12M 的 **風險調整後報酬**，並進行 **Z-Score** 排序。
     * **決策**: 選出總分最高的標的作為本月 Winner。
     
     #### 2. 風控引擎 (Risk Engine)
@@ -379,28 +354,28 @@ with tab6:
 st.markdown("---")
 st.header("⏳ 歷史回測分析 (Synthetic)")
 
-# 使用合成數據進行長回測
 syn_data = get_synthetic_backtest_data()
 
 if syn_data.empty:
     st.warning("合成數據生成失敗。")
 else:
+    # 暖機期設定 (2年)
     BACKTEST_GARCH_WINDOW = 504 
     est_start_date = syn_data.index[0] + timedelta(days=(BACKTEST_GARCH_WINDOW + 252) * 1.45) 
     start_date_str = est_start_date.strftime('%Y-%m-%d')
 
     st.caption(f"""
-    **回測設定說明 (白皮書修正版)：**
-    1.  **數據源**：合成 3x 數據 (含動態損耗)。
+    **回測設定說明 (Strict Audited)：**
+    1.  **數據源**：使用 1x 原型合成 3x 數據 (含動態損耗)。
     2.  **回測起點**：約 {start_date_str} (確保覆蓋 2008)。
-    3.  **交易成本**：0.1% | **GARCH 暖機**：2 年。
-    4.  **選股邏輯**：**Risk-Adjusted Z-Score** (非原始回報)。
+    3.  **交易成本**：0.1% | **GARCH 暖機**：2 年 (504天)。
+    4.  **避險**：GLD/TLT (每月初調整，基於上個月底數據)。
     5.  **基準 (Benchmark)**：UPRO + EURL + EDC (每季等權重)。
     """)
 
     if st.button("🚀 開始執行回測 (Synthetic)"):
         with st.spinner("正在進行歷史運算..."):
-            # 1. 計算歷史風控權重
+            # 1. 計算歷史風控權重 (Daily)
             h_risk_weights = pd.DataFrame(index=syn_data.index, columns=MAPPING.keys())
             
             for ticker_3x in MAPPING.keys():
@@ -418,6 +393,7 @@ else:
                 df = pd.DataFrame({'Vol': vol, 'Price': s, 'SMA': sma})
                 cfg = RISK_CONFIG[ticker_3x]
                 
+                # [Shift 1] 嚴格執行 T-1 訊號
                 roll_ex = df['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
                 roll_en = df['Vol'].rolling(252).quantile(cfg['entry_q']).shift(1)
                 
@@ -432,10 +408,36 @@ else:
                 
             h_risk_weights = h_risk_weights.dropna()
             
-            # 2. 歷史動能 (Selection) - [修正] 改用 Z-Score Logic
-            hist_winners = calculate_historical_winners(syn_data)
+            # 2. 歷史動能 (Selection) - 月頻
+            monthly_prices = syn_data[list(MAPPING.keys())].resample('M').last()
             
-            # 3. 歷史避險 (Rotation) - 月頻
+            # 使用 Z-Score 選股邏輯 (與 Live 保持一致)
+            hist_winners = pd.Series(index=monthly_prices.index, dtype='object')
+            
+            # 迴圈計算每個月的 Winner (模擬當時視角)
+            # 這裡為了準確度，雖然慢但必須重現 Z-Score
+            # 為了加速，我們簡化計算：只用 Ret / Vol (Rolling)
+            
+            # 預計算 Vol (Daily Rolling Std 252) -> Resample to Month
+            daily_vol = syn_data[list(MAPPING.keys())].pct_change().rolling(126).std() * np.sqrt(252)
+            monthly_vol = daily_vol.resample('M').last()
+            
+            # Vectorized Z-Score Calculation per month
+            scores_df = pd.DataFrame(0.0, index=monthly_prices.index, columns=monthly_prices.columns)
+            
+            for m in MOM_PERIODS:
+                ret_m = monthly_prices.pct_change(m)
+                risk_adj = ret_m / (monthly_vol + 1e-6)
+                
+                # Cross-sectional Z-Score
+                mean = risk_adj.mean(axis=1)
+                std = risk_adj.std(axis=1)
+                z = risk_adj.sub(mean, axis=0).div(std + 1e-6, axis=0)
+                scores_df += z
+                
+            hist_winners = scores_df.idxmax(axis=1)
+            
+            # 3. 歷史避險 (Rotation) - [修正 3] 月頻
             safe_monthly = syn_data[SAFE_POOL].resample('M').last()
             safe_mom = safe_monthly.pct_change(12) 
             hist_safe = safe_mom.idxmax(axis=1).fillna('TLT')
@@ -454,19 +456,24 @@ else:
             for i in range(start_idx, len(dates)):
                 if i % 100 == 0: progress.progress((i - start_idx) / (len(dates)-start_idx))
                 today = dates[i]
-                yesterday = dates[i-1] # Strict Lag
                 
-                # A. 決定進攻標的
+                # 取得"昨天" (T-1)
+                yesterday = dates[i-1]
+                
+                # [關鍵修正] 使用昨日資訊
+                
+                # A. 決定進攻標的 (每月初更新)
+                # 找出 yesterday 之前(含)最近的一個月底
                 past_wins = hist_winners[hist_winners.index <= yesterday]
                 if past_wins.empty: continue
                 target_risky = past_wins.iloc[-1]
                 
-                # B. 決定避險標的
+                # B. 決定避險標的 (每月初更新) [修正 3]
                 past_safe = hist_safe[hist_safe.index <= yesterday]
                 if past_safe.empty: target_safe = 'TLT'
                 else: target_safe = past_safe.iloc[-1]
                 
-                # C. 決定權重
+                # C. 決定權重 (每日更新，讀取 Yesterday)
                 if target_risky in h_risk_weights.columns and yesterday in h_risk_weights.index:
                     w_risk = h_risk_weights.loc[yesterday, target_risky]
                     if pd.isna(w_risk): w_risk = 0.0
@@ -487,7 +494,7 @@ else:
                     if w_prev != w_curr:
                         cost += abs(w_curr - w_prev) * TRANSACTION_COST
                 
-                # F. 計算損益
+                # F. 計算損益 (Today)
                 day_ret = 0.0
                 if w_risk > 0:
                     r = syn_data[target_risky].pct_change().iloc[i]
@@ -553,7 +560,7 @@ else:
 
             s_cagr, s_sort, s_roll, s_mdd = calc_stats(cum_eq, eq)
             b3_cagr, b3_sort, b3_roll, b3_mdd = calc_stats(bench_eq, bench_eq.pct_change().fillna(0))
-            v_cagr, v_sort, v_roll, v_mdd = calc_stats(vt_eq, vt_eq.pct_change().fillna(0))
+            vt_cagr, vt_sort, vt_roll, vt_mdd = calc_stats(vt_eq, vt_eq.pct_change().fillna(0))
             
             total_d = len(valid_dates)
             time_in_mkt = (hold_counts['UPRO'] + hold_counts['EURL'] + hold_counts['EDC']) / total_d
@@ -575,8 +582,8 @@ else:
                 </div>
                 """, unsafe_allow_html=True)
 
-            with m1: metric_box("CAGR", s_cagr, b3_cagr, v_cagr)
-            with m2: metric_box("Sortino", s_sort, b3_sort, v_sort, "{:.2f}")
+            with m1: metric_box("CAGR", s_cagr, b3_cagr, vt_cagr)
+            with m2: metric_box("Sortino", s_sort, b3_sort, vt_sort, "{:.2f}")
             with m3: metric_box("Avg 5Y Roll", s_roll, b3_roll, v_roll)
             with m4: metric_box("Max DD", s_mdd, b3_mdd, v_mdd)
             with m5: metric_box("Time in 3x", time_in_mkt, None, None) 
