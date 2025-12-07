@@ -11,7 +11,7 @@ import warnings
 # ==========================================
 # 0. 頁面設定與參數
 # ==========================================
-st.set_page_config(page_title="Dynamic Momentum Strategy (Aligned VT)", layout="wide")
+st.set_page_config(page_title="Dynamic Momentum Strategy (Academic)", layout="wide")
 warnings.simplefilter(action='ignore')
 
 # CSS 美化
@@ -159,12 +159,9 @@ def get_safe_asset_status(data):
     
     monthly = data[SAFE_POOL].resample('M').last()
     if len(monthly) > 12:
-        last_dt = monthly.index[-1]
-        now_dt = data.index[-1]
-        target_idx = -1 if last_dt < now_dt else -2
-        
-        p_now = monthly.iloc[target_idx]
-        p_prev = monthly.iloc[target_idx-12] 
+        # Live 模式: 比較上個月底
+        p_now = monthly.iloc[-1]
+        p_prev = monthly.iloc[-13] 
         ret_12m = (p_now / p_prev) - 1
     else:
         ret_12m = pd.Series(0.0, index=SAFE_POOL)
@@ -188,18 +185,11 @@ def get_synthetic_backtest_data():
             if 'Close' in data_raw.columns.levels[0]: data_raw = data_raw['Close']
             else: data_raw = data_raw['Close'] if 'Close' in data_raw else data_raw
         
-        # [關鍵修正] 不在這裡 dropna VT，保留早期數據給 GARCH 暖機
-        # 只確保核心資產有數據 (VGK 2005~)
+        # 保留 VGK 最早日期
         data_raw = data_raw.ffill().dropna(subset=['VGK', 'EEM', 'SPY', 'GLD', 'TLT'])
         
         synthetic_data = pd.DataFrame(index=data_raw.index)
-        
-        # 複製 VT (早期可能為 NaN)
-        if 'VT' in data_raw.columns:
-            synthetic_data['VT'] = data_raw['VT']
-        
-        # 複製避險資產
-        for t in SAFE_POOL:
+        for t in SAFE_POOL + ['VT']:
             if t in data_raw.columns: synthetic_data[t] = data_raw[t]
             
         REVERSE_MAP = {v: k for k, v in MAPPING.items()} 
@@ -248,7 +238,6 @@ final_weight = latest_risk_row['Weight']
 st.title("🛡️ 雙重動能與動態風控策略")
 st.caption(f"數據基準日: {latest_date.strftime('%Y-%m-%d')}")
 
-# 白皮書
 with st.expander("📖 策略白皮書 (Strategy Whitepaper)", expanded=False):
     st.markdown("""
     ### 策略邏輯摘要
@@ -286,7 +275,7 @@ with c4:
 
 st.divider()
 
-# Tabs
+# Strategy Tabs
 st.subheader("📊 策略透視")
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["1️⃣ 數據層", "2️⃣ 風控層", "3️⃣ 權重層", "4️⃣ 選股層", "5️⃣ 避險資產層", "6️⃣ 執行層"])
 
@@ -349,32 +338,24 @@ syn_data = get_synthetic_backtest_data()
 if syn_data.empty:
     st.warning("合成數據生成失敗。")
 else:
-    # 決定回測起點：
-    # 1. GARCH 暖機期 (504天)
-    # 2. VT 數據起始日 (2008-06-24)
-    # 取兩者較晚者，確保 VT 有數據
+    # 回測暖機期設定 (2年)
     BACKTEST_GARCH_WINDOW = 504 
+    # 實際回測起點：GARCH暖機 + VT數據起點 對齊
+    vt_valid_idx = syn_data['VT'].first_valid_index()
+    warmup_done_idx = syn_data.index[0] + timedelta(days=756)
     
-    # 找出 VT 的第一個有效交易日
-    vt_first_valid = syn_data['VT'].first_valid_index()
-    # 找出 GARCH 暖機完成日 (數據起點 + 504 + 252 Quantile)
-    warmup_done_date = syn_data.index[0] + timedelta(days=756)
-    
-    # 最終起點：取最大值 (確保 VT 有數據 且 GARCH 已暖機)
-    # 如果 VT 數據晚於暖機完成，則從 VT 開始
-    # 這樣回測會從 2008-06 開始，剛好趕上金融海嘯主跌段
-    start_date = max(vt_first_valid, warmup_done_date)
+    # 為了公平，讓所有曲線從同一天開始
+    # 若 VT 較晚上市，則從 VT 上市日開始
+    start_date = max(vt_valid_idx, warmup_done_idx)
     start_idx = syn_data.index.get_loc(start_date)
-    
     start_date_str = start_date.strftime('%Y-%m-%d')
 
     st.caption(f"""
-    **回測設定說明 (Aligned with VT)：**
-    1.  **數據源**：使用 1x 原型合成 3x 數據 (含動態損耗)。
-    2.  **回測起點**：**{start_date_str}** (對齊 VT 上市日且完成 GARCH 暖機)。
-    3.  **交易成本**：0.1% | **GARCH 暖機**：2 年。
-    4.  **避險**：GLD/TLT (每月初調整，基於上個月底數據)。
-    5.  **基準 (Benchmark)**：UPRO + EURL + EDC (每季等權重)。
+    **回測設定說明 (Academic Audited)：**
+    1.  **回測起點**：{start_date_str} (對齊 VT 上市日，確保基準公平)。
+    2.  **交易成本**：0.1% | **GARCH 暖機**：2 年。
+    3.  **無風險利率 (Rf)**：2% (用於 Sharpe/Sortino 計算)。
+    4.  **Sharpe/Sortino 計算**：採用學術定義 (算術平均超額報酬 / 下行均方根偏差)。
     """)
 
     if st.button("🚀 開始執行回測 (Synthetic)"):
@@ -411,32 +392,31 @@ else:
                 
             h_risk_weights = h_risk_weights.dropna()
             
-            # 2. 歷史動能 (Selection) - Z-Score
+            # 2. 歷史動能 (Selection)
             monthly_prices = syn_data[list(MAPPING.keys())].resample('M').last()
+            
+            # Z-Score Calculation (Simplified for speed but logic kept)
             daily_vol = syn_data[list(MAPPING.keys())].pct_change().rolling(126).std() * np.sqrt(252)
             monthly_vol = daily_vol.resample('M').last()
             
             scores_df = pd.DataFrame(0.0, index=monthly_prices.index, columns=monthly_prices.columns)
-            
             for m in MOM_PERIODS:
                 ret_m = monthly_prices.pct_change(m)
                 risk_adj = ret_m / (monthly_vol + 1e-6)
-                
                 mean = risk_adj.mean(axis=1)
                 std = risk_adj.std(axis=1)
                 z = risk_adj.sub(mean, axis=0).div(std + 1e-6, axis=0)
                 scores_df += z
-                
+            
             hist_winners = scores_df.idxmax(axis=1)
             
-            # 3. 歷史避險 (Rotation) - 月頻
+            # 3. 歷史避險 (Rotation)
             safe_monthly = syn_data[SAFE_POOL].resample('M').last()
             safe_mom = safe_monthly.pct_change(12) 
             hist_safe = safe_mom.idxmax(axis=1).fillna('TLT')
             
             # 4. 逐日回測
             dates = syn_data.index
-            # 使用前面計算好的 start_idx (對齊 VT)
             
             strategy_ret = []
             valid_dates = []
@@ -450,7 +430,7 @@ else:
                 today = dates[i]
                 yesterday = dates[i-1] 
                 
-                # A. 取得訊號
+                # A. 訊號
                 past_wins = hist_winners[hist_winners.index <= yesterday]
                 if past_wins.empty: continue
                 target_risky = past_wins.iloc[-1]
@@ -465,12 +445,12 @@ else:
                 else: w_risk = 0.0
                 w_safe = 1.0 - w_risk
                 
-                # B. 構建持倉
+                # B. 持倉
                 curr_pos = {}
                 if w_risk > 0: curr_pos[target_risky] = w_risk
                 if w_safe > 0: curr_pos[target_safe] = w_safe
                 
-                # C. 計算成本
+                # C. 成本
                 cost = 0.0
                 all_assets = set(list(prev_pos.keys()) + list(curr_pos.keys()))
                 for asset in all_assets:
@@ -479,7 +459,7 @@ else:
                     if w_prev != w_curr:
                         cost += abs(w_curr - w_prev) * TRANSACTION_COST
                 
-                # D. 計算損益
+                # D. 損益
                 day_ret = 0.0
                 if w_risk > 0:
                     r = syn_data[target_risky].pct_change().iloc[i]
@@ -503,7 +483,7 @@ else:
             cum_eq = (1 + eq).cumprod()
             dd = cum_eq / cum_eq.cummax() - 1
             
-            # Benchmark (Qtly EqW)
+            # Benchmark (3x EqW)
             b_subset = syn_data[list(MAPPING.keys())].loc[valid_dates].copy()
             b_equity_series = pd.Series(1.0, index=b_subset.index)
             curr_cap = 1.0
@@ -520,18 +500,15 @@ else:
                 val = rel.mean(axis=1) * curr_cap
                 b_equity_series.loc[t_s:t_e] = val
                 curr_cap = val.iloc[-1]
-            
             bench_eq = b_equity_series
             bench_dd = bench_eq / bench_eq.cummax() - 1
             
-            # Benchmark 2 (VT) - now fully aligned
-            vt_eq = pd.Series(1.0, index=valid_dates)
-            if 'VT' in syn_data.columns:
-                vt_ret = syn_data['VT'].loc[valid_dates].pct_change().fillna(0)
-                vt_eq = (1 + vt_ret).cumprod()
+            # Benchmark 2 (VT)
+            vt_ret = syn_data['VT'].loc[valid_dates].pct_change().fillna(0)
+            vt_eq = (1 + vt_ret).cumprod()
             vt_dd = vt_eq / vt_eq.cummax() - 1
             
-            # Stats (Corrected Sortino)
+            # Stats (Strict Academic Definition)
             def calc_stats(equity, daily_r):
                 if len(equity) < 1: return 0,0,0,0,0
                 d = (equity.index[-1] - equity.index[0]).days
@@ -539,22 +516,23 @@ else:
                 cagr = (equity.iloc[-1] / equity.iloc[0]) ** (1/y) - 1
                 mdd = (equity / equity.cummax() - 1).min()
                 
-                # Correct Sortino: RMS of negative returns
-                downside_returns = daily_r.copy()
-                downside_returns[downside_returns > 0] = 0
-                down_std = np.sqrt((downside_returns**2).mean()) * np.sqrt(252)
-                sortino = (cagr - RF_RATE) / (down_std + 1e-6)
-
-                # Sharpe
-                vol = daily_r.std() * np.sqrt(252)
-                sharpe = (cagr - RF_RATE) / (vol + 1e-6)
+                # Sharpe (Arithmetic Excess Return / Vol)
+                rf_daily = RF_RATE / 252
+                excess_ret = daily_r - rf_daily
+                sharpe = (excess_ret.mean() / excess_ret.std()) * np.sqrt(252)
+                
+                # Sortino (Arithmetic Excess Return / Downside RMS)
+                downside_r = excess_ret.copy()
+                downside_r[downside_r > 0] = 0
+                down_std = np.sqrt((downside_r**2).mean()) * np.sqrt(252)
+                sortino = (excess_ret.mean() * 252) / (down_std + 1e-6)
                 
                 roll5 = equity.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260) - 1).mean()
                 return cagr, sortino, sharpe, roll5, mdd
 
             s_cagr, s_sort, s_sharpe, s_roll, s_mdd = calc_stats(cum_eq, eq)
             b3_cagr, b3_sort, b3_sharpe, b3_roll, b3_mdd = calc_stats(bench_eq, bench_eq.pct_change().fillna(0))
-            vt_cagr, vt_sort, vt_sharpe, vt_roll, vt_mdd = calc_stats(vt_eq, vt_eq.pct_change().fillna(0))
+            vt_cagr, vt_sort, vt_sharpe, vt_roll, vt_mdd = calc_stats(vt_eq, vt_ret)
             
             total_d = len(valid_dates)
             time_in_mkt = (hold_counts['UPRO'] + hold_counts['EURL'] + hold_counts['EDC']) / total_d
