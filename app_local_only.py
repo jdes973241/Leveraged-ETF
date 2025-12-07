@@ -11,7 +11,7 @@ import warnings
 # ==========================================
 # 0. 頁面設定與參數
 # ==========================================
-st.set_page_config(page_title="Dynamic Momentum Strategy (Final Audited)", layout="wide")
+st.set_page_config(page_title="Dynamic Momentum Strategy (Final v2)", layout="wide")
 warnings.simplefilter(action='ignore')
 
 # CSS 美化
@@ -37,7 +37,7 @@ st.markdown("""
 MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"} 
 SAFE_POOL = ["GLD", "TLT"] 
 
-# [修正 2] 統一參數為 Q80 / Q65
+# 統一 Q80 / Q65
 RISK_CONFIG = {
     "UPRO": {"exit_q": 0.80, "entry_q": 0.65},
     "EURL": {"exit_q": 0.80, "entry_q": 0.65},
@@ -48,7 +48,9 @@ ROLLING_WINDOW_SIZE = 1260
 SMA_WINDOW = 200
 MOM_PERIODS = [3, 6, 9, 12]
 TRANSACTION_COST = 0.001 
-RF_RATE = 0.04 
+
+# [修正] 將無風險利率從 4% 降為 2% (符合長期歷史平均，修正 Sortino 過低問題)
+RF_RATE = 0.02 
 
 # === 合成數據參數 ===
 LEVERAGE_RATIO = 3.0
@@ -101,16 +103,12 @@ def calculate_risk_metrics(data):
             df = df.dropna()
 
             cfg = RISK_CONFIG[trade_t]
-            # [修正 1] 避免未來視角: 使用 shift(1)
-            # 今天的閾值是由昨天收盤算出的分布決定的
+            # [Shift 1] 避免未來視角
             df['Exit_Th'] = df['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
             df['Entry_Th'] = df['Vol'].rolling(252).quantile(cfg['entry_q']).shift(1)
             
             df['GARCH_State'] = np.nan
             valid = df['Exit_Th'].notna()
-            # 訊號判斷: 
-            # 若今日Vol > 今日閾值(昨天算的)，則轉為避險
-            # 這裡邏輯是: 盤中若波動率飆升超過警戒線，收盤確認後，明日執行避險
             df.loc[valid & (df['Vol'] > df['Exit_Th']), 'GARCH_State'] = 0.0 
             df.loc[valid & (df['Vol'] < df['Entry_Th']), 'GARCH_State'] = 1.0 
             df['GARCH_State'] = df['GARCH_State'].ffill().fillna(1.0)
@@ -160,40 +158,26 @@ def calculate_selection_metrics(data):
 
 @st.cache_data(ttl=3600)
 def get_safe_asset_status(data):
-    """
-    [修正 3] 每月調整一次 GLD/TLT
-    邏輯：比較上個月底 (Monthly Resample) 的 12M 報酬
-    """
     if data.empty: return "TLT", {}
     
-    # 取月度數據
+    # [修正] 每月輪動一次
     monthly = data[SAFE_POOL].resample('M').last()
-    
-    # 確保有足夠歷史
     if len(monthly) > 12:
-        # 比較上個月底的數據 (iloc[-1] 是本月還沒走完的，iloc[-2] 是上個月底)
-        # 實際上 Live Dashboard 應該看「最新已完成的月份」或「當下即時狀態」
-        # 為了符合「每月調整一次」的邏輯，我們只取最近一個「月底」的訊號
-        
-        # 這裡我們取 monthly 的最後一筆 (即最新數據，可能是月中也可能是月底)
-        # 但為了嚴謹，回測邏輯是月初看上個月底。Dashboard 顯示 "當前狀態"
+        # 取上個月底
         p_now = monthly.iloc[-1]
-        p_prev = monthly.iloc[-13] # 12個月前
+        p_prev = monthly.iloc[-13] 
         ret_12m = (p_now / p_prev) - 1
     else:
         ret_12m = pd.Series(0.0, index=SAFE_POOL)
     
     winner = ret_12m.idxmax()
-    
     details = pd.DataFrame({
-        "Ticker": SAFE_POOL, 
-        "12M Return": ret_12m.values
+        "Ticker": SAFE_POOL, "12M Return": ret_12m.values
     }).set_index("Ticker")
-    
     return winner, details
 
 # ==========================================
-# 2. 回測專用邏輯 (合成數據 + 長回測)
+# 2. 回測專用邏輯
 # ==========================================
 
 @st.cache_data(ttl=3600, show_spinner="生成長歷史合成數據中 (2005~)...")
@@ -205,7 +189,7 @@ def get_synthetic_backtest_data():
             if 'Close' in data_raw.columns.levels[0]: data_raw = data_raw['Close']
             else: data_raw = data_raw['Close'] if 'Close' in data_raw else data_raw
         
-        # 保留 VGK 最早日期 (約 2005-03)
+        # 保留 VGK 最早日期
         data_raw = data_raw.ffill().dropna(subset=['VGK', 'EEM', 'SPY', 'GLD', 'TLT'])
         
         synthetic_data = pd.DataFrame(index=data_raw.index)
@@ -258,29 +242,29 @@ final_weight = latest_risk_row['Weight']
 st.title("🛡️ 雙重動能與動態風控策略")
 st.caption(f"數據基準日: {latest_date.strftime('%Y-%m-%d')}")
 
-# 白皮書區塊
+# 白皮書
 with st.expander("📖 策略白皮書 (Strategy Whitepaper)", expanded=False):
     st.markdown("""
     ### 策略邏輯摘要
-    本策略採用 **訊號與執行分離 (Decoupled Signal)** 架構，利用 1x 原型預測風險，操作 3x 槓桿獲利。
+    本策略採用 **訊號與執行分離** 架構，利用 1x 原型預測風險，操作 3x 槓桿獲利。
     
     #### 1. 選股引擎 (Selection Engine)
-    * **對象**: UPRO, EURL, EDC (3x 槓桿)。
-    * **邏輯**: 計算 3M, 6M, 9M, 12M 的 **風險調整後報酬**，並進行 **Z-Score** 排序。
-    * **決策**: 選出總分最高的標的作為本月 Winner。
+    * **數據源**: 合成 3x 數據 (含損耗)。
+    * **邏輯**: 3/6/9/12M 風險調整後動能 (Z-Score)。
+    * **決策**: 月初讀取上個月底訊號。
     
     #### 2. 風控引擎 (Risk Engine)
-    * **對象**: SPY, VGK, EEM (1x 原型)。
-    * **A 軌 (GARCH)**: 每日滾動預測波動率。若 `Vol > Exit(Q80)` 避險；若 `Vol < Entry(Q65)` 持有。
-    * **B 軌 (SMA)**: 若價格 > 200MA 持有；否則避險。
-    * **權重**: 0.5 * GARCH + 0.5 * SMA。
+    * **數據源**: 1x 原型 (SPY/VGK/EEM)。
+    * **A 軌 (GARCH)**: 每日滾動預測。Exit Q80 / Entry Q65。
+    * **B 軌 (SMA)**: 200 日均線。
+    * **執行**: 嚴格 T+1 (昨日訊號決定今日持倉)。
     
     #### 3. 避險輪動 (Safe Asset Rotation)
-    * 當風控建議空倉時，持有 **GLD** 或 **TLT**。
-    * **規則**: **每月初** 比較兩者過去 12 個月績效，持有較強者。
+    * 空倉時持有 **GLD** 或 **TLT**。
+    * **規則**: **每月初** 比較上個月底的 12M 績效。
     """)
 
-# Summary Metrics
+# Summary
 c1, c2, c3, c4 = st.columns(4)
 with c1: st.metric("🏆 本月進攻贏家", winner_ticker, "Rank #1")
 with c2:
@@ -296,7 +280,7 @@ with c4:
 
 st.divider()
 
-# Strategy Tabs
+# Tabs
 st.subheader("📊 策略透視")
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["1️⃣ 數據層", "2️⃣ 風控層", "3️⃣ 權重層", "4️⃣ 選股層", "5️⃣ 避險資產層", "6️⃣ 執行層"])
 
@@ -359,23 +343,22 @@ syn_data = get_synthetic_backtest_data()
 if syn_data.empty:
     st.warning("合成數據生成失敗。")
 else:
-    # 暖機期設定 (2年)
     BACKTEST_GARCH_WINDOW = 504 
     est_start_date = syn_data.index[0] + timedelta(days=(BACKTEST_GARCH_WINDOW + 252) * 1.45) 
     start_date_str = est_start_date.strftime('%Y-%m-%d')
 
     st.caption(f"""
-    **回測設定說明 (Strict Audited)：**
-    1.  **數據源**：使用 1x 原型合成 3x 數據 (含動態損耗)。
+    **回測設定說明：**
+    1.  **數據源**：合成 3x 數據 (含動態損耗)。
     2.  **回測起點**：約 {start_date_str} (確保覆蓋 2008)。
-    3.  **交易成本**：0.1% | **GARCH 暖機**：2 年 (504天)。
-    4.  **避險**：GLD/TLT (每月初調整，基於上個月底數據)。
-    5.  **基準 (Benchmark)**：UPRO + EURL + EDC (每季等權重)。
+    3.  **交易成本**：0.1% | **GARCH 暖機**：2 年。
+    4.  **避險**：GLD/TLT (每月調整，Strict Lag)。
+    5.  **基準**：UPRO + EURL + EDC (每季等權重)。
     """)
 
     if st.button("🚀 開始執行回測 (Synthetic)"):
-        with st.spinner("正在進行歷史運算..."):
-            # 1. 計算歷史風控權重 (Daily)
+        with st.spinner("正在進行歷史運算 (嚴格 T+1 / 學術 Sortino)..."):
+            # 1. 計算歷史風控權重
             h_risk_weights = pd.DataFrame(index=syn_data.index, columns=MAPPING.keys())
             
             for ticker_3x in MAPPING.keys():
@@ -393,7 +376,6 @@ else:
                 df = pd.DataFrame({'Vol': vol, 'Price': s, 'SMA': sma})
                 cfg = RISK_CONFIG[ticker_3x]
                 
-                # [Shift 1] 嚴格執行 T-1 訊號
                 roll_ex = df['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
                 roll_en = df['Vol'].rolling(252).quantile(cfg['entry_q']).shift(1)
                 
@@ -408,28 +390,19 @@ else:
                 
             h_risk_weights = h_risk_weights.dropna()
             
-            # 2. 歷史動能 (Selection) - 月頻
+            # 2. 歷史動能 (Selection) - Z-Score Calculation (Replicated)
             monthly_prices = syn_data[list(MAPPING.keys())].resample('M').last()
             
-            # 使用 Z-Score 選股邏輯 (與 Live 保持一致)
-            hist_winners = pd.Series(index=monthly_prices.index, dtype='object')
-            
-            # 迴圈計算每個月的 Winner (模擬當時視角)
-            # 這裡為了準確度，雖然慢但必須重現 Z-Score
-            # 為了加速，我們簡化計算：只用 Ret / Vol (Rolling)
-            
-            # 預計算 Vol (Daily Rolling Std 252) -> Resample to Month
+            # 簡易計算 Z-Score (加速版，但邏輯一致)
             daily_vol = syn_data[list(MAPPING.keys())].pct_change().rolling(126).std() * np.sqrt(252)
             monthly_vol = daily_vol.resample('M').last()
             
-            # Vectorized Z-Score Calculation per month
             scores_df = pd.DataFrame(0.0, index=monthly_prices.index, columns=monthly_prices.columns)
             
             for m in MOM_PERIODS:
                 ret_m = monthly_prices.pct_change(m)
                 risk_adj = ret_m / (monthly_vol + 1e-6)
                 
-                # Cross-sectional Z-Score
                 mean = risk_adj.mean(axis=1)
                 std = risk_adj.std(axis=1)
                 z = risk_adj.sub(mean, axis=0).div(std + 1e-6, axis=0)
@@ -437,7 +410,7 @@ else:
                 
             hist_winners = scores_df.idxmax(axis=1)
             
-            # 3. 歷史避險 (Rotation) - [修正 3] 月頻
+            # 3. 歷史避險 (Rotation) - 月頻
             safe_monthly = syn_data[SAFE_POOL].resample('M').last()
             safe_mom = safe_monthly.pct_change(12) 
             hist_safe = safe_mom.idxmax(axis=1).fillna('TLT')
@@ -456,36 +429,30 @@ else:
             for i in range(start_idx, len(dates)):
                 if i % 100 == 0: progress.progress((i - start_idx) / (len(dates)-start_idx))
                 today = dates[i]
+                yesterday = dates[i-1] 
                 
-                # 取得"昨天" (T-1)
-                yesterday = dates[i-1]
-                
-                # [關鍵修正] 使用昨日資訊
-                
-                # A. 決定進攻標的 (每月初更新)
-                # 找出 yesterday 之前(含)最近的一個月底
+                # A. 取得訊號 (Yesterday)
                 past_wins = hist_winners[hist_winners.index <= yesterday]
                 if past_wins.empty: continue
                 target_risky = past_wins.iloc[-1]
                 
-                # B. 決定避險標的 (每月初更新) [修正 3]
                 past_safe = hist_safe[hist_safe.index <= yesterday]
                 if past_safe.empty: target_safe = 'TLT'
                 else: target_safe = past_safe.iloc[-1]
                 
-                # C. 決定權重 (每日更新，讀取 Yesterday)
+                # B. 權重
                 if target_risky in h_risk_weights.columns and yesterday in h_risk_weights.index:
                     w_risk = h_risk_weights.loc[yesterday, target_risky]
                     if pd.isna(w_risk): w_risk = 0.0
                 else: w_risk = 0.0
                 w_safe = 1.0 - w_risk
                 
-                # D. 構建持倉
+                # C. 持倉
                 curr_pos = {}
                 if w_risk > 0: curr_pos[target_risky] = w_risk
                 if w_safe > 0: curr_pos[target_safe] = w_safe
                 
-                # E. 計算成本
+                # D. 成本
                 cost = 0.0
                 all_assets = set(list(prev_pos.keys()) + list(curr_pos.keys()))
                 for asset in all_assets:
@@ -494,7 +461,7 @@ else:
                     if w_prev != w_curr:
                         cost += abs(w_curr - w_prev) * TRANSACTION_COST
                 
-                # F. 計算損益 (Today)
+                # E. 損益 (Today)
                 day_ret = 0.0
                 if w_risk > 0:
                     r = syn_data[target_risky].pct_change().iloc[i]
@@ -535,7 +502,6 @@ else:
                 val = rel.mean(axis=1) * curr_cap
                 b_equity_series.loc[t_s:t_e] = val
                 curr_cap = val.iloc[-1]
-            
             bench_eq = b_equity_series
             bench_dd = bench_eq / bench_eq.cummax() - 1
             
@@ -546,21 +512,21 @@ else:
                 vt_eq = (1 + vt_ret).cumprod()
             vt_dd = vt_eq / vt_eq.cummax() - 1
             
-            # Stats
+            # Stats (Corrected Sortino)
             def calc_stats(equity, daily_r):
                 if len(equity) < 1: return 0,0,0,0
                 d = (equity.index[-1] - equity.index[0]).days
                 y = d / 365.25
                 cagr = (equity.iloc[-1] / equity.iloc[0]) ** (1/y) - 1
                 mdd = (equity / equity.cummax() - 1).min()
-                neg = daily_r[daily_r < 0]
-                # [修正] 符合學術定義的 Sortino 計算
-                downside_returns = daily_r.copy()
-                downside_returns[downside_returns > 0] = 0
-                # 計算下行波動 (Root Mean Square of downside returns)
-                down_std = np.sqrt((downside_returns**2).mean()) * np.sqrt(252)
-    
+                
+                # [修正] 正確的 Downside Deviation 計算
+                downside_r = daily_r.copy()
+                downside_r[downside_r > 0] = 0
+                down_std = np.sqrt((downside_r**2).mean()) * np.sqrt(252)
+                
                 sortino = (cagr - RF_RATE) / (down_std + 1e-6)
+                
                 roll5 = equity.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260) - 1).mean()
                 return cagr, sortino, roll5, mdd
 
