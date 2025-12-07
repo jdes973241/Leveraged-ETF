@@ -11,7 +11,7 @@ import warnings
 # ==========================================
 # 0. 頁面設定與參數
 # ==========================================
-st.set_page_config(page_title="Dynamic Momentum Strategy (Final Fixed)", layout="wide")
+st.set_page_config(page_title="Dynamic Momentum Strategy (Final + Sharpe)", layout="wide")
 warnings.simplefilter(action='ignore')
 
 # CSS 美化
@@ -48,7 +48,7 @@ ROLLING_WINDOW_SIZE = 1260
 SMA_WINDOW = 200
 MOM_PERIODS = [3, 6, 9, 12]
 TRANSACTION_COST = 0.001 
-RF_RATE = 0.04 
+RF_RATE = 0.02 # 修正為 2% 符合長期平均
 
 # === 合成數據參數 ===
 LEVERAGE_RATIO = 3.0
@@ -101,7 +101,7 @@ def calculate_risk_metrics(data):
             df = df.dropna()
 
             cfg = RISK_CONFIG[trade_t]
-            # Dashboard 顯示用 (Shift 1 表示昨收數值應用於今日)
+            # Shift 1 避免未來視角
             df['Exit_Th'] = df['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
             df['Entry_Th'] = df['Vol'].rolling(252).quantile(cfg['entry_q']).shift(1)
             
@@ -158,13 +158,13 @@ def calculate_selection_metrics(data):
 def get_safe_asset_status(data):
     if data.empty: return "TLT", {}
     
-    # Live 模式: 比較上個月底的績效
     monthly = data[SAFE_POOL].resample('M').last()
     if len(monthly) > 12:
-        # 取倒數第二筆 (上個月底) 確保是已實現的數據
-        # 如果今天是月底，取倒數第一筆
-        last_date = monthly.index[-1]
-        target_idx = -1 if last_date.date() <= data.index[-1].date() else -2
+        # Live 模式: 比較上個月底 (iloc[-2] or iloc[-1] depending on date)
+        # 簡單起見，取最近一筆完整月資料
+        last_dt = monthly.index[-1]
+        now_dt = data.index[-1]
+        target_idx = -1 if last_dt < now_dt else -2 # 如果最後一筆是本月(未完)，取上個月
         
         p_now = monthly.iloc[target_idx]
         p_prev = monthly.iloc[target_idx-12] 
@@ -243,7 +243,7 @@ final_weight = latest_risk_row['Weight']
 st.title("🛡️ 雙重動能與動態風控策略")
 st.caption(f"數據基準日: {latest_date.strftime('%Y-%m-%d')}")
 
-# 白皮書區塊
+# 白皮書
 with st.expander("📖 策略白皮書 (Strategy Whitepaper)", expanded=False):
     st.markdown("""
     ### 策略邏輯摘要
@@ -265,7 +265,7 @@ with st.expander("📖 策略白皮書 (Strategy Whitepaper)", expanded=False):
     * **規則**: **每月初** 比較兩者過去 12 個月績效，持有較強者。
     """)
 
-# Summary Metrics
+# Summary
 c1, c2, c3, c4 = st.columns(4)
 with c1: st.metric("🏆 本月進攻贏家", winner_ticker, "Rank #1")
 with c2:
@@ -281,7 +281,7 @@ with c4:
 
 st.divider()
 
-# Strategy Tabs
+# Tabs
 st.subheader("📊 策略透視")
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["1️⃣ 數據層", "2️⃣ 風控層", "3️⃣ 權重層", "4️⃣ 選股層", "5️⃣ 避險資產層", "6️⃣ 執行層"])
 
@@ -349,8 +349,8 @@ else:
     start_date_str = est_start_date.strftime('%Y-%m-%d')
 
     st.caption(f"""
-    **回測設定說明 (白皮書規格)：**
-    1.  **數據源**：使用 1x 原型合成 3x 數據 (含動態損耗)。
+    **回測設定說明：**
+    1.  **數據源**：合成 3x 數據 (含動態損耗)。
     2.  **回測起點**：約 {start_date_str} (確保覆蓋 2008)。
     3.  **交易成本**：0.1% | **GARCH 暖機**：2 年。
     4.  **避險**：GLD/TLT (每月初調整，基於上個月底數據)。
@@ -391,7 +391,7 @@ else:
                 
             h_risk_weights = h_risk_weights.dropna()
             
-            # 2. 歷史動能 (Selection) - Z-Score Calculation
+            # 2. 歷史動能 (Selection) - Z-Score
             monthly_prices = syn_data[list(MAPPING.keys())].resample('M').last()
             daily_vol = syn_data[list(MAPPING.keys())].pct_change().rolling(126).std() * np.sqrt(252)
             monthly_vol = daily_vol.resample('M').last()
@@ -430,27 +430,29 @@ else:
                 today = dates[i]
                 yesterday = dates[i-1] 
                 
-                # A. 取得訊號 (Yesterday)
+                # A. 進攻標的
                 past_wins = hist_winners[hist_winners.index <= yesterday]
                 if past_wins.empty: continue
                 target_risky = past_wins.iloc[-1]
                 
+                # B. 避險標的
                 past_safe = hist_safe[hist_safe.index <= yesterday]
                 if past_safe.empty: target_safe = 'TLT'
                 else: target_safe = past_safe.iloc[-1]
                 
+                # C. 權重
                 if target_risky in h_risk_weights.columns and yesterday in h_risk_weights.index:
                     w_risk = h_risk_weights.loc[yesterday, target_risky]
                     if pd.isna(w_risk): w_risk = 0.0
                 else: w_risk = 0.0
                 w_safe = 1.0 - w_risk
                 
-                # B. 構建持倉
+                # D. 構建持倉
                 curr_pos = {}
                 if w_risk > 0: curr_pos[target_risky] = w_risk
                 if w_safe > 0: curr_pos[target_safe] = w_safe
                 
-                # C. 計算成本
+                # E. 計算成本
                 cost = 0.0
                 all_assets = set(list(prev_pos.keys()) + list(curr_pos.keys()))
                 for asset in all_assets:
@@ -459,7 +461,7 @@ else:
                     if w_prev != w_curr:
                         cost += abs(w_curr - w_prev) * TRANSACTION_COST
                 
-                # D. 計算損益 (Today)
+                # F. 計算損益 (Today)
                 day_ret = 0.0
                 if w_risk > 0:
                     r = syn_data[target_risky].pct_change().iloc[i]
@@ -472,7 +474,6 @@ else:
                     
                 strategy_ret.append(day_ret - cost)
                 valid_dates.append(today)
-                
                 hold_counts[target_risky] += w_risk
                 hold_counts[target_safe] += w_safe
                 prev_pos = curr_pos
@@ -484,7 +485,7 @@ else:
             cum_eq = (1 + eq).cumprod()
             dd = cum_eq / cum_eq.cummax() - 1
             
-            # Benchmark (Qtly EqW)
+            # Benchmark 1 (3x EqW Quarterly)
             b_subset = syn_data[list(MAPPING.keys())].loc[valid_dates].copy()
             b_equity_series = pd.Series(1.0, index=b_subset.index)
             curr_cap = 1.0
@@ -512,30 +513,30 @@ else:
                 vt_eq = (1 + vt_ret).cumprod()
             vt_dd = vt_eq / vt_eq.cummax() - 1
             
-            # Stats
+            # Stats (Added Sharpe)
             def calc_stats(equity, daily_r):
-                if len(equity) < 1: return 0,0,0,0
+                if len(equity) < 1: return 0,0,0,0,0
                 d = (equity.index[-1] - equity.index[0]).days
                 y = d / 365.25
                 cagr = (equity.iloc[-1] / equity.iloc[0]) ** (1/y) - 1
                 mdd = (equity / equity.cummax() - 1).min()
                 
-                # [Correct Sortino]
+                # Sortino (Downside)
                 downside_returns = daily_r.copy()
                 downside_returns[downside_returns > 0] = 0
                 down_std = np.sqrt((downside_returns**2).mean()) * np.sqrt(252)
-                
                 sortino = (cagr - RF_RATE) / (down_std + 1e-6)
+
+                # Sharpe (Vol)
+                vol = daily_r.std() * np.sqrt(252)
+                sharpe = (cagr - RF_RATE) / (vol + 1e-6)
                 
                 roll5 = equity.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260) - 1).mean()
-                return cagr, sortino, roll5, mdd
+                return cagr, sortino, sharpe, roll5, mdd
 
-            s_cagr, s_sort, s_roll, s_mdd = calc_stats(cum_eq, eq)
-            vt_ret_daily = vt_eq.pct_change().fillna(0)
-            bench_ret_daily = bench_eq.pct_change().fillna(0)
-            
-            b3_cagr, b3_sort, b3_roll, b3_mdd = calc_stats(bench_eq, bench_ret_daily)
-            vt_cagr, vt_sort, vt_roll, vt_mdd = calc_stats(vt_eq, vt_ret_daily)
+            s_cagr, s_sort, s_sharpe, s_roll, s_mdd = calc_stats(cum_eq, eq)
+            b3_cagr, b3_sort, b3_sharpe, b3_roll, b3_mdd = calc_stats(bench_eq, bench_eq.pct_change().fillna(0))
+            vt_cagr, vt_sort, vt_sharpe, vt_roll, vt_mdd = calc_stats(vt_eq, vt_eq.pct_change().fillna(0))
             
             total_d = len(valid_dates)
             time_in_mkt = (hold_counts['UPRO'] + hold_counts['EURL'] + hold_counts['EDC']) / total_d
@@ -544,7 +545,7 @@ else:
             
             # --- Display ---
             st.write("### 📈 回測績效指標")
-            m1, m2, m3, m4, m5 = st.columns(5)
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
             
             def metric_box(label, value, b3_val=None, vt_val=None, fmt="{:.2%}"):
                 b3_str = f"3x: {fmt.format(b3_val)}" if b3_val is not None else ""
@@ -559,9 +560,10 @@ else:
 
             with m1: metric_box("CAGR", s_cagr, b3_cagr, vt_cagr)
             with m2: metric_box("Sortino", s_sort, b3_sort, vt_sort, "{:.2f}")
-            with m3: metric_box("Avg 5Y Roll", s_roll, b3_roll, vt_roll)
-            with m4: metric_box("Max DD", s_mdd, b3_mdd, vt_mdd)
-            with m5: metric_box("Time in 3x", time_in_mkt, None, None) 
+            with m3: metric_box("Sharpe", s_sharpe, b3_sharpe, vt_sharpe, "{:.2f}")
+            with m4: metric_box("Avg 5Y Roll", s_roll, b3_roll, vt_roll)
+            with m5: metric_box("Max DD", s_mdd, b3_mdd, vt_mdd)
+            with m6: metric_box("Time in 3x", time_in_mkt, None, None) 
             
             st.markdown(f"**平均資產分佈:** {alloc_str}")
             
