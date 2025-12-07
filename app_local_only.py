@@ -11,7 +11,7 @@ import warnings
 # ==========================================
 # 0. 頁面設定與參數
 # ==========================================
-st.set_page_config(page_title="Dynamic Momentum Strategy (Final Corrected v3)", layout="wide")
+st.set_page_config(page_title="Dynamic Momentum Strategy (Aligned VT)", layout="wide")
 warnings.simplefilter(action='ignore')
 
 # CSS 美化
@@ -159,9 +159,12 @@ def get_safe_asset_status(data):
     
     monthly = data[SAFE_POOL].resample('M').last()
     if len(monthly) > 12:
-        # Live 模式: 比較上個月底
-        p_now = monthly.iloc[-1]
-        p_prev = monthly.iloc[-13] 
+        last_dt = monthly.index[-1]
+        now_dt = data.index[-1]
+        target_idx = -1 if last_dt < now_dt else -2
+        
+        p_now = monthly.iloc[target_idx]
+        p_prev = monthly.iloc[target_idx-12] 
         ret_12m = (p_now / p_prev) - 1
     else:
         ret_12m = pd.Series(0.0, index=SAFE_POOL)
@@ -185,11 +188,18 @@ def get_synthetic_backtest_data():
             if 'Close' in data_raw.columns.levels[0]: data_raw = data_raw['Close']
             else: data_raw = data_raw['Close'] if 'Close' in data_raw else data_raw
         
-        # 保留 VGK 最早日期
+        # [關鍵修正] 不在這裡 dropna VT，保留早期數據給 GARCH 暖機
+        # 只確保核心資產有數據 (VGK 2005~)
         data_raw = data_raw.ffill().dropna(subset=['VGK', 'EEM', 'SPY', 'GLD', 'TLT'])
         
         synthetic_data = pd.DataFrame(index=data_raw.index)
-        for t in SAFE_POOL + ['VT']:
+        
+        # 複製 VT (早期可能為 NaN)
+        if 'VT' in data_raw.columns:
+            synthetic_data['VT'] = data_raw['VT']
+        
+        # 複製避險資產
+        for t in SAFE_POOL:
             if t in data_raw.columns: synthetic_data[t] = data_raw[t]
             
         REVERSE_MAP = {v: k for k, v in MAPPING.items()} 
@@ -238,7 +248,7 @@ final_weight = latest_risk_row['Weight']
 st.title("🛡️ 雙重動能與動態風控策略")
 st.caption(f"數據基準日: {latest_date.strftime('%Y-%m-%d')}")
 
-# 白皮書區塊
+# 白皮書
 with st.expander("📖 策略白皮書 (Strategy Whitepaper)", expanded=False):
     st.markdown("""
     ### 策略邏輯摘要
@@ -276,7 +286,7 @@ with c4:
 
 st.divider()
 
-# Strategy Tabs
+# Tabs
 st.subheader("📊 策略透視")
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["1️⃣ 數據層", "2️⃣ 風控層", "3️⃣ 權重層", "4️⃣ 選股層", "5️⃣ 避險資產層", "6️⃣ 執行層"])
 
@@ -339,14 +349,29 @@ syn_data = get_synthetic_backtest_data()
 if syn_data.empty:
     st.warning("合成數據生成失敗。")
 else:
+    # 決定回測起點：
+    # 1. GARCH 暖機期 (504天)
+    # 2. VT 數據起始日 (2008-06-24)
+    # 取兩者較晚者，確保 VT 有數據
     BACKTEST_GARCH_WINDOW = 504 
-    est_start_date = syn_data.index[0] + timedelta(days=(BACKTEST_GARCH_WINDOW + 252) * 1.45) 
-    start_date_str = est_start_date.strftime('%Y-%m-%d')
+    
+    # 找出 VT 的第一個有效交易日
+    vt_first_valid = syn_data['VT'].first_valid_index()
+    # 找出 GARCH 暖機完成日 (數據起點 + 504 + 252 Quantile)
+    warmup_done_date = syn_data.index[0] + timedelta(days=756)
+    
+    # 最終起點：取最大值 (確保 VT 有數據 且 GARCH 已暖機)
+    # 如果 VT 數據晚於暖機完成，則從 VT 開始
+    # 這樣回測會從 2008-06 開始，剛好趕上金融海嘯主跌段
+    start_date = max(vt_first_valid, warmup_done_date)
+    start_idx = syn_data.index.get_loc(start_date)
+    
+    start_date_str = start_date.strftime('%Y-%m-%d')
 
     st.caption(f"""
-    **回測設定說明：**
-    1.  **數據源**：使用 1x 原型合成 3x 數據。
-    2.  **回測起點**：約 {start_date_str} (確保覆蓋 2008)。
+    **回測設定說明 (Aligned with VT)：**
+    1.  **數據源**：使用 1x 原型合成 3x 數據 (含動態損耗)。
+    2.  **回測起點**：**{start_date_str}** (對齊 VT 上市日且完成 GARCH 暖機)。
     3.  **交易成本**：0.1% | **GARCH 暖機**：2 年。
     4.  **避險**：GLD/TLT (每月初調整，基於上個月底數據)。
     5.  **基準 (Benchmark)**：UPRO + EURL + EDC (每季等權重)。
@@ -386,7 +411,7 @@ else:
                 
             h_risk_weights = h_risk_weights.dropna()
             
-            # 2. 歷史動能 (Selection) - Z-Score Calculation
+            # 2. 歷史動能 (Selection) - Z-Score
             monthly_prices = syn_data[list(MAPPING.keys())].resample('M').last()
             daily_vol = syn_data[list(MAPPING.keys())].pct_change().rolling(126).std() * np.sqrt(252)
             monthly_vol = daily_vol.resample('M').last()
@@ -411,7 +436,7 @@ else:
             
             # 4. 逐日回測
             dates = syn_data.index
-            start_idx = BACKTEST_GARCH_WINDOW + 252 
+            # 使用前面計算好的 start_idx (對齊 VT)
             
             strategy_ret = []
             valid_dates = []
@@ -425,7 +450,7 @@ else:
                 today = dates[i]
                 yesterday = dates[i-1] 
                 
-                # A. 取得訊號 (Yesterday)
+                # A. 取得訊號
                 past_wins = hist_winners[hist_winners.index <= yesterday]
                 if past_wins.empty: continue
                 target_risky = past_wins.iloc[-1]
@@ -454,7 +479,7 @@ else:
                     if w_prev != w_curr:
                         cost += abs(w_curr - w_prev) * TRANSACTION_COST
                 
-                # D. 計算損益 (Today)
+                # D. 計算損益
                 day_ret = 0.0
                 if w_risk > 0:
                     r = syn_data[target_risky].pct_change().iloc[i]
@@ -499,14 +524,14 @@ else:
             bench_eq = b_equity_series
             bench_dd = bench_eq / bench_eq.cummax() - 1
             
-            # Benchmark 2 (VT)
+            # Benchmark 2 (VT) - now fully aligned
             vt_eq = pd.Series(1.0, index=valid_dates)
             if 'VT' in syn_data.columns:
                 vt_ret = syn_data['VT'].loc[valid_dates].pct_change().fillna(0)
                 vt_eq = (1 + vt_ret).cumprod()
             vt_dd = vt_eq / vt_eq.cummax() - 1
             
-            # Stats (Corrected Sortino Calculation)
+            # Stats (Corrected Sortino)
             def calc_stats(equity, daily_r):
                 if len(equity) < 1: return 0,0,0,0,0
                 d = (equity.index[-1] - equity.index[0]).days
