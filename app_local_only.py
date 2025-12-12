@@ -12,7 +12,7 @@ import warnings
 # ==========================================
 # 0. 頁面設定
 # ==========================================
-st.set_page_config(page_title="Dynamic Momentum (Full Restore)", layout="wide")
+st.set_page_config(page_title="Dynamic Momentum (Final Fix)", layout="wide")
 warnings.simplefilter(action='ignore')
 alt.data_transformers.disable_max_rows()
 
@@ -30,6 +30,8 @@ st.markdown("""
     .metric-label {font-size: 14px; color: #555555; margin-bottom: 0; font-weight: 500;}
     .metric-value {font-size: 24px; font-weight: bold; color: #000000 !important; margin: 5px 0;}
     .metric-sub {font-size: 12px; color: #666666; margin-bottom: 0;}
+    .buy-text {color: #28a745; font-weight: bold;}
+    .sell-text {color: #dc3545; font-weight: bold;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -201,7 +203,6 @@ def get_synthetic_backtest_data():
 
 @st.cache_data(ttl=3600, show_spinner="計算滾動回測訊號 (需時較長)...")
 def calculate_backtest_signals(data):
-    # A. Rolling GARCH
     h_risk_weights = pd.DataFrame(index=data.index, columns=MAPPING.keys())
     REFIT_STEP = 5 
     p_bar = st.progress(0)
@@ -235,10 +236,8 @@ def calculate_backtest_signals(data):
         vol_s = pd.Series(forecasts).reindex(data.index)
         df_ind = pd.DataFrame({'Vol': vol_s, 'Price': s_price, 'SMA': s_sma})
         cfg = RISK_CONFIG[ticker_3x]
-        
         df_ind['Exit'] = df_ind['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
         df_ind['Entry'] = df_ind['Vol'].rolling(252).quantile(cfg['entry_q']).shift(1)
-        
         g = pd.Series(np.nan, index=df_ind.index)
         valid = df_ind['Exit'].notna()
         g.loc[valid & (df_ind['Vol'] > df_ind['Exit'])] = 0.0
@@ -251,7 +250,6 @@ def calculate_backtest_signals(data):
     p_bar.empty()
     h_risk_weights = h_risk_weights.dropna()
     
-    # B. Monthly Selection
     monthly_prices = get_monthly_data(data[list(MAPPING.keys())])
     daily_vol = data[list(MAPPING.keys())].pct_change().rolling(126).std() * np.sqrt(252)
     monthly_vol = get_monthly_data(daily_vol)
@@ -263,7 +261,6 @@ def calculate_backtest_signals(data):
         scores += z
     hist_winners = scores.idxmax(axis=1)
     
-    # C. Monthly Safe
     safe_monthly = get_monthly_data(data[SAFE_POOL])
     hist_safe = safe_monthly.pct_change(12).idxmax(axis=1).fillna('TLT')
     return h_risk_weights, hist_winners, hist_safe
@@ -276,7 +273,6 @@ def run_strict_backtest(data, risk_weights, winners_series, safe_signals):
     
     if start_date not in dates: start_idx = dates.searchsorted(start_date)
     else: start_idx = dates.get_loc(start_date)
-    
     if start_idx >= len(dates): return None, None, None, None
     
     strategy_ret = []
@@ -292,23 +288,19 @@ def run_strict_backtest(data, risk_weights, winners_series, safe_signals):
         today = dates[i]
         yesterday = dates[i-1]
         
-        # Monthly Lock Signal
         past_wins = winners_series[winners_series.index <= yesterday]
         if past_wins.empty: continue
         target_risky = past_wins.iloc[-1]
-        
         past_safe = safe_signals[safe_signals.index <= yesterday]
         if past_safe.empty: target_safe = 'TLT'
         else: target_safe = past_safe.iloc[-1]
         
-        # Daily Risk Weight
         if target_risky in risk_weights.columns and yesterday in risk_weights.index:
             w_risk = risk_weights.loc[yesterday, target_risky]
             if pd.isna(w_risk): w_risk = 0.0
         else: w_risk = 0.0
         w_safe = 1.0 - w_risk
         
-        # Execution
         curr_pos = {}
         if w_risk > 0: curr_pos[target_risky] = w_risk
         if w_safe > 0: curr_pos[target_safe] = w_safe
@@ -337,11 +329,9 @@ def run_strict_backtest(data, risk_weights, winners_series, safe_signals):
         prev_pos = curr_pos
         
     p_bar.empty()
-    
     eq = pd.Series(strategy_ret, index=valid_dates)
     cum_eq = (1 + eq).cumprod()
     
-    # Bench
     b_sub = data[list(MAPPING.keys())].loc[valid_dates].copy()
     b_eq = pd.Series(1.0, index=b_sub.index)
     curr = 1.0
@@ -356,18 +346,16 @@ def run_strict_backtest(data, risk_weights, winners_series, safe_signals):
         val = rel.mean(axis=1) * curr
         b_eq.loc[t_s:t_e] = val
         curr = val.iloc[-1]
-        
-    vt_eq = (1 + data['VT'].loc[valid_dates].pct_change().fillna(0)).cumprod()
     
+    vt_eq = (1 + data['VT'].loc[valid_dates].pct_change().fillna(0)).cumprod()
     return cum_eq, b_eq, vt_eq, hold_counts
 
 # ==========================================
-# 7. Dashboard 介面
+# 7. Dashboard
 # ==========================================
-st.title("🛡️ 雙重動能與動態風控 (Complete Restore)")
-st.caption("架構: Monthly Lock Selection / Daily Risk / Strict T+1 / Rolling GARCH")
+st.title("🛡️ 雙重動能與動態風控 (Final Version)")
+st.caption(f"數據基準日: {datetime.now().strftime('%Y-%m-%d')} | 架構: Monthly Lock / Daily Risk / Strict T+1")
 
-# Live Data
 live_data = get_live_data()
 risk_live = calculate_live_risk(live_data)
 sel_df, sel_date = calculate_live_selection(live_data)
@@ -388,7 +376,6 @@ if sel_date:
 with st.expander("📖 策略白皮書", expanded=False):
     st.markdown("""
     ### 策略邏輯摘要
-    本策略採用 **訊號與執行分離** 架構，利用 1x 原型預測風險，操作 3x 槓桿獲利。
     * **選股**: 月初鎖定上個月底贏家 (3/6/9/12M Z-Score)。
     * **風控**: 每日滾動 GARCH (Q80/Q65) + 200 SMA。
     * **避險**: 月初鎖定上個月底 GLD/TLT 贏家。
@@ -407,7 +394,6 @@ with c4:
 
 st.divider()
 
-# 六大分頁 (Restored)
 t1, t2, t3, t4, t5, t6 = st.tabs(["1️⃣ 數據層", "2️⃣ 風控層", "3️⃣ 權重層", "4️⃣ 選股層", "5️⃣ 避險層", "6️⃣ 執行層"])
 with t1: st.dataframe(live_data.tail(5).style.format("{:.2f}"), use_container_width=True)
 with t2:
@@ -420,9 +406,16 @@ with t4: st.dataframe(sel_df.style.format("{:.2f}"), use_container_width=True)
 with t5: st.dataframe(safe_df.style.format("{:.2%}"), use_container_width=True)
 with t6: st.success(f"持有 **{final_w*100:.0f}% {winner}** + **{(1-final_w)*100:.0f}% {safe_win}**")
 
-# 回測區塊 (Restored Details)
 st.divider()
 st.header("⏳ 歷史回測 (Synthetic)")
+
+with st.expander("ℹ️ 詳細回測設定", expanded=True):
+    st.markdown("""
+    * **數據源**: 合成 3x (含損耗)。
+    * **起點**: 對齊 VT 上市日。
+    * **模型**: 滾動 GARCH (每 5 日重訓，窗口 2 年)。
+    * **邏輯**: 月鎖定選股 / 日風控調整。
+    """)
 
 syn_data = get_synthetic_backtest_data()
 if not syn_data.empty:
@@ -431,25 +424,21 @@ if not syn_data.empty:
         s_eq, b_eq, v_eq, holds = run_strict_backtest(syn_data, h_risk, h_win, h_safe)
         
         if s_eq is not None:
-            # Stats (Restored)
             def calc_stats(eq, dr):
                 d = (eq.index[-1] - eq.index[0]).days
                 cagr = (eq.iloc[-1]) ** (365.25/d) - 1
                 mdd = (eq / eq.cummax() - 1).min()
-                rf_daily = RF_RATE / 252
-                excess = dr - rf_daily
+                excess = dr - (RF_RATE/252)
                 sharpe = (excess.mean()/excess.std())*np.sqrt(252)
                 down = excess.copy(); down[down>0]=0
                 down_std = np.sqrt((down**2).mean())*np.sqrt(252)
                 sortino = (excess.mean()*252)/(down_std+1e-6)
-                roll5 = eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1).mean()
-                return cagr, sortino, sharpe, roll5, mdd
+                return cagr, sortino, sharpe, mdd
             
             s_s = calc_stats(s_eq, s_eq.pct_change().fillna(0))
             b_s = calc_stats(b_eq, b_eq.pct_change().fillna(0))
             v_s = calc_stats(v_eq, v_eq.pct_change().fillna(0))
             
-            # Metrics
             st.write("### 績效指標")
             m1, m2, m3, m4, m5, m6 = st.columns(6)
             
@@ -460,17 +449,32 @@ if not syn_data.empty:
                     <p class="metric-value">{fmt.format(v)}</p>
                     <p class="metric-sub">3x: {fmt.format(b)} | VT: {fmt.format(vt)}</p>
                 </div>""", unsafe_allow_html=True)
-                
+            
+            # [修正變數名稱] v_s[3] -> MaxDD, r5 logic moved below
+            r5_s = s_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1).mean()
+            r5_b = b_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1).mean()
+            r5_v = v_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1).mean()
+
             with m1: m_box("CAGR", s_s[0], b_s[0], v_s[0])
             with m2: m_box("Sortino", s_s[1], b_s[1], v_s[1], "{:.2f}")
             with m3: m_box("Sharpe", s_s[2], b_s[2], v_s[2], "{:.2f}")
-            with m4: m_box("Avg 5Y", s_s[3], b_s[3], v_s[3])
-            with m5: m_box("MaxDD", s_s[4], b_s[4], v_s[4])
+            with m4: m_box("Avg 5Y", r5_s, r5_b, r5_v)
+            with m5: m_box("MaxDD", s_s[3], b_s[3], v_s[3])
             
             t_3x = sum([v for k,v in holds.items() if 'Syn_' in k]) / len(s_eq)
             with m6: m_box("Time in 3x", t_3x, 1.0, 1.0)
             
-            # Charts (Restored 3 Charts)
+            st.write("#### 詳細數據")
+            res_df = pd.DataFrame([
+                ["Strategy", *s_s, r5_s],
+                ["Bench (3x)", *b_s, r5_b],
+                ["Bench (VT)", *v_s, r5_v]
+            ], columns=["Name", "CAGR", "Sortino", "Sharpe", "MaxDD", "Avg 5Y"])
+            
+            for c in ["CAGR", "MaxDD", "Avg 5Y"]: res_df[c] = res_df[c].apply(lambda x: f"{x:.2%}")
+            for c in ["Sortino", "Sharpe"]: res_df[c] = res_df[c].apply(lambda x: f"{x:.2f}")
+            st.table(res_df)
+
             st.write("#### 📊 權益曲線 (Log Scale)")
             df_chart = pd.DataFrame({'Date': s_eq.index, 'Strategy': s_eq, 'Bench (3x)': b_eq, 'VT': v_eq}).melt('Date', var_name='Asset', value_name='NAV')
             c1 = alt.Chart(df_chart).mark_line().encode(x='Date', y=alt.Y('NAV', scale=alt.Scale(type='log')), color='Asset', tooltip=['Date','Asset', alt.Tooltip('NAV', format='.2f')]).properties(width=800, height=350).interactive()
@@ -485,9 +489,9 @@ if not syn_data.empty:
             st.altair_chart(c2, use_container_width=True)
             
             st.write("#### 🔄 滾動 5 年報酬率 (Rolling 5Y CAGR)")
-            r5_s = s_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1)
-            r5_b = b_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1)
-            r5_v = vt_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1)
-            df_r5 = pd.DataFrame({'Date': s_eq.index, 'Strategy': r5_s, 'Bench (3x)': r5_b, 'VT': r5_v}).melt('Date', var_name='Asset', value_name='Roll5Y')
+            roll_s = s_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1)
+            roll_b = b_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1)
+            roll_v = v_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1)
+            df_r5 = pd.DataFrame({'Date': s_eq.index, 'Strategy': roll_s, 'Bench (3x)': roll_b, 'VT': roll_v}).melt('Date', var_name='Asset', value_name='Roll5Y')
             c3 = alt.Chart(df_r5.dropna()).mark_line().encode(x='Date', y=alt.Y('Roll5Y', axis=alt.Axis(format='%')), color='Asset', tooltip=['Date','Asset', alt.Tooltip('Roll5Y', format='.2%')]).properties(width=800, height=250).interactive()
             st.altair_chart(c3, use_container_width=True)
