@@ -39,7 +39,7 @@ st.markdown("""
 MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"} 
 SAFE_POOL = ["GLD", "TLT"] 
 
-# 風控閾值 (Exit 0.95 / Entry 0.65)
+# 風控閾值 (維持原設定 Exit 0.95 / Entry 0.65)
 RISK_CONFIG = {
     "UPRO": {"exit_q": 0.95, "entry_q": 0.65},
     "EURL": {"exit_q": 0.95, "entry_q": 0.65},
@@ -173,7 +173,9 @@ def calculate_live_selection(data):
 
 @st.cache_data(ttl=3600)
 def calculate_live_safe(data):
-    if data.empty: return "TLT", {}, None
+    # [FIX] 修正此處返回類型，確保返回 pd.DataFrame() 而非 {}
+    if data.empty: return "TLT", pd.DataFrame(), None
+    
     monthly = get_monthly_data(data[SAFE_POOL])
     last_date = data.index[-1]
     current_period = last_date.to_period('M')
@@ -433,8 +435,8 @@ with st.expander("📖 策略詳細規格", expanded=False):
     
     **3. 波動風控 (Volatility)**
     * **滾動 GARCH**: 每日計算，使用過去 504 天數據。
-    * **Exit**: 預測波動率 > 歷史 PR 95。
-    * **Entry**: 預測波動率 < 歷史 PR 65。
+    * **Exit**: 預測波動率 > 歷史 PR {RISK_CONFIG['UPRO']['exit_q']*100:.0f}。
+    * **Entry**: 預測波動率 < 歷史 PR {RISK_CONFIG['UPRO']['entry_q']*100:.0f}。
     
     **4. 避險 (Safe Asset)**
     * **GLD vs TLT**: 每月底比較過去 12 個月報酬，強者持有。
@@ -448,6 +450,7 @@ with c2:
 with c3: 
     st.metric("GARCH 風控", "安全" if g_state==1 else "危險", delta="✅" if g_state==1 else "🔻")
 with c4: 
+    # [FIX] 使用 .loc 前先確認 safe_df 是否為空 (已在上層修正為 DataFrame)
     s_val = safe_df.loc[safe_win, '12M Return'] if not safe_df.empty else 0
     st.metric("🛡️ 避險資產", safe_win, f"12M: {s_val:.1%}")
 
