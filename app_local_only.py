@@ -38,7 +38,7 @@ st.markdown("""
 MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"} 
 SAFE_POOL = ["GLD", "TLT"] 
 
-# 風控閾值 (已修改：Exit 0.99 / Entry 0.90 - 極度寬鬆/積極模式)
+# 風控閾值 (Exit 0.99 / Entry 0.90)
 RISK_CONFIG = {
     "UPRO": {"exit_q": 0.99, "entry_q": 0.90},
     "EURL": {"exit_q": 0.99, "entry_q": 0.90},
@@ -62,7 +62,6 @@ def get_daily_leverage_cost(date):
 def get_monthly_data(df):
     """鎖定每個月實際最後交易日"""
     if df.empty: return df
-    # 確保索引是 DatetimeIndex
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
         
@@ -77,26 +76,18 @@ def get_monthly_data(df):
 def get_live_data():
     tickers = list(MAPPING.keys()) + list(MAPPING.values()) + SAFE_POOL
     try:
-        # [FIX] 下載數據，增加 group_by='ticker' 以確保格式一致性
         data = yf.download(tickers, period="5y", interval="1d", auto_adjust=True, progress=False, group_by='column')
         
-        # [FIX] 處理 MultiIndex (yfinance 的欄位結構可能會變)
         if isinstance(data.columns, pd.MultiIndex):
-            # 嘗試提取 'Close'，如果失敗則嘗試提取 Level 0
             if 'Close' in data.columns.levels[0]:
                 data = data['Close']
             else:
-                # 如果結構不同，嘗試保留所有數據並自動對齊
                 pass
 
-        # [FIX] 強制移除時區 (避免與 Pandas 本地時間衝突)
         if data.index.tz is not None:
             data.index = data.index.tz_localize(None)
 
-        # [FIX] 只用 ffill，移除 dropna() 以避免單一資產缺漏導致全表刪除
         data = data.ffill()
-        
-        # 移除全部為空值的行（例如假日）
         data = data.dropna(how='all')
         
         return data
@@ -108,8 +99,6 @@ def get_live_data():
 def calculate_live_risk(data):
     if data.empty: return {}
     
-    # 1. SMA (Monthly)
-    # [FIX] 確保欄位存在才提取
     avail_cols = [c for c in list(MAPPING.keys()) if c in data.columns]
     if not avail_cols: return {}
     
@@ -121,9 +110,8 @@ def calculate_live_risk(data):
     risk_details = {}
     for trade_t, signal_t in MAPPING.items():
         if signal_t not in data.columns: continue
-        # 如果交易資產(UPRO等)不在數據中，暫時用訊號資產(SPY)代替計算SMA，但標記為缺漏
         if trade_t not in data.columns: 
-             series = data[signal_t] # Fallback for display
+             series = data[signal_t] 
         else:
              series = data[trade_t]
              
@@ -139,16 +127,13 @@ def calculate_live_risk(data):
             cond_vol = res.conditional_volatility * np.sqrt(252)
             
             df = pd.DataFrame({'Price': series, 'Ret': ret})
-            # 將波動率對齊回原始索引
             df['Vol'] = pd.Series(cond_vol, index=window.index).reindex(df.index)
             
-            # [FIX] 確保 SMA 狀態對齊
             if trade_t in daily_sma_sig.columns:
                 df['SMA_State'] = daily_sma_sig[trade_t]
             else:
-                # 如果沒有 UPRO 的 SMA，用 SPY 的代替 (邏輯上應一致)
                 if MAPPING[trade_t] in daily_sma_sig.columns: 
-                    df['SMA_State'] = 1.0 # Default safely or handle logic error
+                    df['SMA_State'] = 1.0 
                 else:
                     df['SMA_State'] = 0.0
             
@@ -159,7 +144,6 @@ def calculate_live_risk(data):
             df['GARCH_State'] = np.nan
             valid = df['Exit_Th'].notna() & df['Vol'].notna()
             
-            # 使用 mask 避免 SettingWithCopyWarning
             mask_exit = valid & (df['Vol'] > df['Exit_Th'])
             mask_entry = valid & (df['Vol'] < df['Entry_Th'])
             
@@ -168,7 +152,7 @@ def calculate_live_risk(data):
             df['GARCH_State'] = df['GARCH_State'].ffill().fillna(1.0)
             
             df['Weight'] = (0.5 * df['GARCH_State']) + (0.5 * df['SMA_State'])
-            df = df.dropna(subset=['Weight']) # 只移除無法計算訊號的行
+            df = df.dropna(subset=['Weight'])
             risk_details[trade_t] = df
         except: continue
     return risk_details
@@ -177,7 +161,6 @@ def calculate_live_risk(data):
 def calculate_live_selection(data):
     if data.empty: return pd.DataFrame(), None
     
-    # [FIX] 檢查可用欄位
     avail_keys = [k for k in list(MAPPING.keys()) if k in data.columns]
     if not avail_keys: return pd.DataFrame(), None
     
@@ -199,8 +182,6 @@ def calculate_live_selection(data):
         try:
             p_now = monthly.loc[ref_date, ticker]
             for m in MOM_PERIODS:
-                # 使用 shift 避免索引錯誤
-                # 找到 ref_date 的位置
                 if ref_date not in monthly.index: continue
                 loc = monthly.index.get_loc(ref_date)
                 
@@ -236,7 +217,6 @@ def calculate_live_selection(data):
 
 @st.cache_data(ttl=3600)
 def calculate_live_safe(data):
-    # [FIX] 確保返回 DataFrame
     if data.empty: return "TLT", pd.DataFrame(), None
     
     avail_safe = [t for t in SAFE_POOL if t in data.columns]
@@ -270,7 +250,6 @@ def get_synthetic_backtest_data():
     try:
         data_raw = yf.download(tickers, period="max", interval="1d", auto_adjust=True, progress=False)
         
-        # [FIX] 同樣的數據清理邏輯
         if isinstance(data_raw.columns, pd.MultiIndex):
             if 'Close' in data_raw.columns.levels[0]: data_raw = data_raw['Close']
             else: pass
@@ -278,15 +257,8 @@ def get_synthetic_backtest_data():
         if data_raw.index.tz is not None:
             data_raw.index = data_raw.index.tz_localize(None)
 
-        data_raw = data_raw.ffill() # 移除 dropna，避免太嚴格
+        data_raw = data_raw.ffill()
         
-        # 檢查關鍵欄位是否存在
-        required = ['VGK', 'EEM', 'SPY', 'GLD', 'TLT']
-        missing = [x for x in required if x not in data_raw.columns]
-        if missing:
-             # 如果缺數據，嘗試從 MultiIndex 找
-             pass
-
         synthetic_data = pd.DataFrame(index=data_raw.index)
         if 'VT' in data_raw.columns: synthetic_data['VT'] = data_raw['VT']
         for t in SAFE_POOL: 
@@ -303,7 +275,7 @@ def get_synthetic_backtest_data():
             synthetic_data[ticker_3x] = (1 + ret_3x).cumprod() * 100
             synthetic_data[f"RAW_{ticker_3x}"] = data_raw[ticker_1x] 
             
-        return synthetic_data.dropna() # 合成數據最後再清理
+        return synthetic_data.dropna()
     except: return pd.DataFrame()
 
 @st.cache_data(ttl=3600, show_spinner="計算滾動回測訊號 (這需要約 1 分鐘)...")
@@ -316,26 +288,22 @@ def calculate_backtest_signals_rolling(data):
     monthly_sma = monthly_prices.rolling(SMA_MONTHS).mean()
     monthly_sma_sig = (monthly_prices > monthly_sma).astype(float)
     daily_sma_sig = monthly_sma_sig.reindex(data.index).ffill().shift(1)
-    # 修正 Column Name mapping
     daily_sma_sig.columns = [c.replace("RAW_", "") for c in raw_cols]
 
-    # 2. 滾動 GARCH (Rolling)
+    # 2. 滾動 GARCH
     target_tickers = [k for k in MAPPING.keys() if f"RAW_{k}" in data.columns]
     h_risk_weights = pd.DataFrame(index=data.index, columns=target_tickers)
     
     for i, ticker_3x in enumerate(target_tickers):
         col_1x = f"RAW_{ticker_3x}"
-        
         s_ret = data[col_1x].pct_change() * 100
         forecasts = {}
         model_res = None
         loop_start = BACKTEST_GARCH_WINDOW
         
-        # 使用 numpy 加速處理
         ret_values = s_ret.values
         dates = s_ret.index
         
-        # 內層迴圈
         for t in range(loop_start, len(s_ret)):
             if (t - loop_start) % REFIT_STEP == 0 or model_res is None:
                 train = s_ret.iloc[t-BACKTEST_GARCH_WINDOW : t]
@@ -395,12 +363,14 @@ def calculate_backtest_signals_rolling(data):
 
 def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
     dates = data.index
-    # 起始點: GARCH窗口 + 252 Quantile
+    # 起始點: GARCH窗口(504) + Quantile窗口(252) = 756
     start_idx = BACKTEST_GARCH_WINDOW + 252
     
+    # 檢查 VT 上市時間，避免回測早期 VT 數據為空
     vt_start = data['VT'].first_valid_index()
     if vt_start:
         vt_idx = data.index.get_loc(vt_start)
+        # 取最大值，確保數據與模型皆已備妥
         start_idx = max(start_idx, vt_idx)
     
     if start_idx >= len(dates): return None, None, None, None
@@ -457,8 +427,11 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
             
         strategy_ret.append(day_ret - cost)
         valid_dates.append(today)
+        
+        # 記錄持倉以計算 Time in 3x
         hold_counts[target_risky] += w_risk
         hold_counts[target_safe] += w_safe
+        
         prev_pos = curr_pos
         
     eq = pd.Series(strategy_ret, index=valid_dates)
@@ -519,22 +492,96 @@ else:
 if sel_date:
     st.info(f"🔒 **訊號鎖定日**: {sel_date.strftime('%Y-%m-%d')} (上個月最後交易日)")
 
-with st.expander("📖 策略詳細規格", expanded=False):
-    st.markdown(f"""
-    **1. 選股 (Selection)**
-    * 每月上個月底，計算 3/6/9/12 個月風險調整動能 (Z-Score)。
-    * 選出最強 1 檔 (UPRO/EURL/EDC)。
+with st.expander("📖 策略詳細規則", expanded=False):
+    st.markdown(r"""
+    這份程式碼建構了一個 **「雙重動能與動態雙層風控（Dual Momentum with Dynamic Dual-Layer Risk Control）」** 的策略儀表板，並包含即時監控（Live）與嚴格的滾動回測（Strict Rolling Backtest）兩大模組。
     
-    **2. 趨勢風控 (Trend)**
-    * **{SMA_MONTHS} 個月均線**: 每月底檢視，價格 > 均線 = 安全。
+    以下是依據程式碼邏輯拆解的完整策略規格與數據細節：
     
-    **3. 波動風控 (Volatility)**
-    * **滾動 GARCH**: 每日計算，使用過去 504 天數據。
-    * **Exit**: 預測波動率 > 歷史 PR {RISK_CONFIG['UPRO']['exit_q']*100:.0f} (寬鬆)。
-    * **Entry**: 預測波動率 < 歷史 PR {RISK_CONFIG['UPRO']['entry_q']*100:.0f} (積極)。
+    ### 1. 投資全集與資產映射 (Asset Universe)
+    策略採用 **槓桿 ETF** 作為進攻資產，並透過 **原型 ETF (1x)** 的數據來生成訊號與合成回測歷史，以解決槓桿 ETF 歷史數據過短的問題。
     
-    **4. 避險 (Safe Asset)**
-    * **GLD vs TLT**: 每月底比較過去 12 個月報酬，強者持有。
+    | 角色 | 交易代號 (3x) | 訊號源代號 (1x) | 對應資產類別 |
+    | :--- | :--- | :--- | :--- |
+    | **進攻 (Risky)** | **UPRO** | SPY | 美股大型股 (S&P 500) |
+    | **進攻 (Risky)** | **EURL** | VGK | 歐洲已開發市場 |
+    | **進攻 (Risky)** | **EDC** | EEM | 新興市場 |
+    | **避險 (Safe)** | **GLD** / **TLT** | (自身) | 黃金 / 20年期美債 |
+    
+    ### 2. 進攻資產選擇機制 (Selection Logic)
+    策略每月進行一次選股，挑選當下動能最強的 **1 檔** 進攻資產。
+    * **頻率**：月頻（Monthly），於每個月最後一個交易日計算。
+    * **動能指標**：綜合風險調整動能 Z-Score (Composite Risk-Adjusted Momentum Z-Score)。
+    * **計算步驟**：
+        1. **多週期回報**：計算 3、6、9、12 個月的累積報酬率。
+        2. **波動率調整**：將上述報酬率除以過去 126 天（約半年）的年化波動率，得到 Sharpe-like ratio。
+        3. **標準化 (Z-Score)**：將三個標的在同一週期內的數值進行標準化（Z-Score）。
+        4. **加總評分**：將四個週期 (3/6/9/12M) 的 Z-Score 相加，總分最高者勝出。
+    
+    ### 3. 雙層動態風控機制 (Risk Control Logic)
+    選定標的後，透過兩層風控決定曝險比例（Weight）。每層風控貢獻 50% 權重，因此持倉水位可能為 **0% (全避險)、50% (半倉)、100% (全攻)**。
+    
+    **第一層：趨勢濾網 (Trend Filter) - 權重 50%**
+    * **指標**：6 個月簡單移動平均線 (SMA 6 Months)。
+    * **邏輯**：
+        * 若 **月收盤價 > 6個月均線** $\rightarrow$ **SMA_State = 1 (安全)**。
+        * 若 **月收盤價 < 6個月均線** $\rightarrow$ **SMA_State = 0 (危險)**。
+    * **數據源**：使用原型 ETF (如 SPY) 判斷。
+    
+    **第二層：波動率濾網 (Volatility Filter) - 權重 50%**
+    * **模型**：GARCH(1,1) with Student's t-distribution。
+    * **訓練窗口**：
+        * **Live**：最近 504 天。
+        * **Backtest**：嚴格滾動視窗（Rolling Window），只看過去 504 天，絕不使用未來數據。
+    * **重訓頻率 (Refit)**：每 5 天重新擬合一次 GARCH 參數。
+    * **訊號邏輯 (Regime Switching)**：
+        1. 預測 T 日的條件波動率 (Conditional Volatility)。
+        2. 計算該波動率在過去 252 天歷史中的 **百分位數 (Quantile/Percentile)**。
+        3. **出場 (Exit)**：若波動率 > 歷史 **99%** 分位數 $\rightarrow$ **GARCH_State = 0 (危險)**。
+        4. **進場 (Entry)**：若波動率 < 歷史 **90%** 分位數 $\rightarrow$ **GARCH_State = 1 (安全)**。
+        5. **滯後性**：具備 Hysteresis 特性，未觸發閾值前維持原狀態。
+    
+    ### 4. 避險資產輪動 (Safe Asset Rotation)
+    當進攻資產權重未滿 100% 時，剩餘資金配置於避險資產。
+    * **候選池**：GLD (黃金), TLT (美債)。
+    * **選擇邏輯**：比較兩者 **過去 12 個月** 的累積報酬率，強者勝出。
+    * **預設值**：若數據不足，預設持有 TLT。
+    
+    ### 5. 嚴格回測細節 (Strict Backtest Specifics)
+    這部分程式碼非常強調「真實性」與「防偏誤」，具體實作如下：
+    
+    **合成數據 (Synthetic Data)**：
+    * 不直接使用 3x ETF 歷史數據（因時間太短）。
+    * **合成公式**：$Ret_{3x} = (Ret_{1x} \times 3.0) - Cost_{borrow}$。
+    * **融資成本 ($Cost_{borrow}$)**：動態設定。
+        * 2008-2021 (低利時期)：年化 2%。
+        * 2022-至今 (升息時期) 或 2007以前：年化 5%。
+    
+    **無前視偏差 (Look-Ahead Bias Free)**：
+    * GARCH 模型訓練嚴格限制在 **t-504** 到 **t-1** 的視窗內。
+    * SMA 與動能訊號均使用 T-1 日或上個月底的數據。
+    
+    **交易執行細節**：
+    * **T+1 執行**：T 日計算出的訊號，於 T+1 日開盤/收盤價執行（程式碼邏輯為日報酬結算，隱含 T+1 概念）。
+    * **交易成本**：單邊 **0.1% (10 bps)**。
+    * **無風險利率 (Risk-Free Rate)**：計算 Sharpe Ratio 時使用年化 2%。
+    
+    ### 6. 輸出指標 (Dashboard Metrics)
+    儀表板最終計算並展示以下關鍵績效指標：
+    * **CAGR**：年化複合成長率。
+    * **Sharpe Ratio**：夏普比率 (超額報酬 / 標準差)。
+    * **Sortino Ratio**：索提諾比率 (只考慮下行波動)。
+    * **Max Drawdown**：最大回撤。
+    * **Avg Roll 5Y**：滾動 5 年平均年化報酬率（評估長期持有穩定性）。
+    * **Time in 3x**：持有 3x 槓桿資產的時間比例。
+    
+    **總結：策略核心公式**
+    
+    $$Weight_{Risky} = 0.5 \times I(Price > SMA_{6m}) + 0.5 \times I(Vol_{GARCH} < Threshold)$$
+    
+    $$Position = Weight_{Risky} \times \text{Best\_Momentum\_3x} + (1 - Weight_{Risky}) \times \text{Best\_Safe\_Asset}$$
+    
+    這是一個結合了 **「相對動能 (選股)」** 與 **「雙重絕對動能 (擇時)」** 的複合策略。
     """)
 
 c1, c2, c3, c4 = st.columns(4)
@@ -568,24 +615,7 @@ st.divider()
 # 5. 回測區塊 (Strict Rolling)
 # ==========================================
 st.header("⏳ 嚴格滾動回測 (Synthetic 3x)")
-
-# 文檔說明
-with st.expander("📊 查看回測步驟與數據細節", expanded=True):
-    st.markdown("""
-    #### 1. 數據源與合成
-    * **進攻資產**: 使用 1x 原型 ETF (SPY, VGK, EEM) 的歷史數據。
-    * **合成三倍**: 模擬 3x 槓桿，並扣除動態融資成本 (2%~5%)。
-    * **避險資產**: 使用真實 GLD 與 TLT 數據。
-    
-    #### 2. 嚴格滾動風控 (Rolling GARCH)
-    * **訓練視窗**: 嚴格限制為過去 **504 個交易日** (無未來視角)。
-    * **參數重訓**: 每 **5 天** 重新擬合一次 GARCH 模型參數 (Refit)。
-    * **訊號生成**: T-1 日收盤預測 T 日波動率，並與過去 252 天分位數 (Q99/Q90) 比較。
-    
-    #### 3. 趨勢與執行
-    * **趨勢**: 使用合成資產的 **6個月月均線**，月底鎖定訊號。
-    * **執行**: 嚴格 **T+1** 開盤執行 (訊號來自 T-1 收盤)。
-    """)
+st.caption("回測數據使用 1x 原型 ETF 合成，並自動對齊 VT 上市日以確保基準一致。")
 
 syn_data = get_synthetic_backtest_data()
 
@@ -635,7 +665,10 @@ if not syn_data.empty:
             with m4: m_box("Avg 5Y", r5_s, r5_b, r5_v)
             with m5: m_box("MaxDD", s_s[3], b_s[3], v_s[3])
             
-            t_3x = sum([v for k,v in holds.items() if 'Syn_' in k]) / len(s_eq)
+            # [FIX] Time in 3x 修正邏輯
+            # holds 的 key 是 3x ticker 名稱 (e.g. UPRO, EURL)，檢查 key 是否在 MAPPING 中
+            risky_hold_sum = sum([v for k,v in holds.items() if k in MAPPING.keys()])
+            t_3x = risky_hold_sum / len(s_eq)
             with m6: m_box("Time in 3x", t_3x, 1.0, 1.0)
             
             st.divider()
