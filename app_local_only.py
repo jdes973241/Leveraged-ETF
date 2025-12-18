@@ -11,7 +11,7 @@ import warnings
 # ==========================================
 # 0. 頁面設定
 # ==========================================
-st.set_page_config(page_title="Dynamic Momentum Strategy", layout="wide")
+st.set_page_config(page_title="Dynamic Momentum Strategy (Aggressive)", layout="wide")
 warnings.simplefilter(action='ignore')
 alt.data_transformers.disable_max_rows()
 
@@ -38,11 +38,11 @@ st.markdown("""
 MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"} 
 SAFE_POOL = ["GLD", "TLT"] 
 
-# 風控閾值 (維持原設定 Exit 0.95 / Entry 0.65)
+# 風控閾值 (已修改：Exit 0.99 / Entry 0.90 - 極度寬鬆/積極模式)
 RISK_CONFIG = {
-    "UPRO": {"exit_q": 0.95, "entry_q": 0.65},
-    "EURL": {"exit_q": 0.95, "entry_q": 0.65},
-    "EDC":  {"exit_q": 0.95, "entry_q": 0.65}
+    "UPRO": {"exit_q": 0.99, "entry_q": 0.90},
+    "EURL": {"exit_q": 0.99, "entry_q": 0.90},
+    "EDC":  {"exit_q": 0.99, "entry_q": 0.90}
 }
 
 # 策略參數
@@ -147,7 +147,7 @@ def calculate_live_risk(data):
                 df['SMA_State'] = daily_sma_sig[trade_t]
             else:
                 # 如果沒有 UPRO 的 SMA，用 SPY 的代替 (邏輯上應一致)
-                if MAPPING[trade_t] in daily_sma_sig.columns: # Attempt reverse lookup logic manually if needed, but simple fallback:
+                if MAPPING[trade_t] in daily_sma_sig.columns: 
                     df['SMA_State'] = 1.0 # Default safely or handle logic error
                 else:
                     df['SMA_State'] = 0.0
@@ -489,7 +489,7 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
 # 4. Dashboard 介面
 # ==========================================
 st.title("🛡️ 雙重動能與動態風控 (Live + Rolling Backtest)")
-st.caption(f"配置: SMA {SMA_MONTHS}M (Monthly) / GARCH (Q{RISK_CONFIG['UPRO']['exit_q']}) / Safe (GLD/TLT)")
+st.caption(f"配置: SMA {SMA_MONTHS}M (Monthly) / GARCH (Q{RISK_CONFIG['UPRO']['exit_q']*100:.0f}) / Safe (GLD/TLT)")
 
 # --- Debug Panel (隱藏式) ---
 with st.expander("🛠️ 數據除錯與狀態 (若數據為 N/A 請點此)"):
@@ -530,8 +530,8 @@ with st.expander("📖 策略詳細規格", expanded=False):
     
     **3. 波動風控 (Volatility)**
     * **滾動 GARCH**: 每日計算，使用過去 504 天數據。
-    * **Exit**: 預測波動率 > 歷史 PR {RISK_CONFIG['UPRO']['exit_q']*100:.0f}。
-    * **Entry**: 預測波動率 < 歷史 PR {RISK_CONFIG['UPRO']['entry_q']*100:.0f}。
+    * **Exit**: 預測波動率 > 歷史 PR {RISK_CONFIG['UPRO']['exit_q']*100:.0f} (寬鬆)。
+    * **Entry**: 預測波動率 < 歷史 PR {RISK_CONFIG['UPRO']['entry_q']*100:.0f} (積極)。
     
     **4. 避險 (Safe Asset)**
     * **GLD vs TLT**: 每月底比較過去 12 個月報酬，強者持有。
@@ -580,7 +580,7 @@ with st.expander("📊 查看回測步驟與數據細節", expanded=True):
     #### 2. 嚴格滾動風控 (Rolling GARCH)
     * **訓練視窗**: 嚴格限制為過去 **504 個交易日** (無未來視角)。
     * **參數重訓**: 每 **5 天** 重新擬合一次 GARCH 模型參數 (Refit)。
-    * **訊號生成**: T-1 日收盤預測 T 日波動率，並與過去 252 天分位數 (Q95/Q65) 比較。
+    * **訊號生成**: T-1 日收盤預測 T 日波動率，並與過去 252 天分位數 (Q99/Q90) 比較。
     
     #### 3. 趨勢與執行
     * **趨勢**: 使用合成資產的 **6個月月均線**，月底鎖定訊號。
