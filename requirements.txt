@@ -6,3 +6,4 @@ altair
 arch
 tabulate
 tqdm
+pytz
