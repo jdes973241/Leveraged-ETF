@@ -7,6 +7,7 @@ from arch import arch_model
 from collections import defaultdict
 from datetime import datetime, timedelta
 import warnings
+import pytz # 引入時區庫以確保萬無一失
 
 # ==========================================
 # 0. 頁面設定
@@ -33,10 +34,16 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# [新增] 快取管理工具
+# [新增] 快取管理與時間診斷工具 (側邊欄)
 # ==========================================
 with st.sidebar:
     st.write("🔧 系統工具")
+    
+    # 顯示系統當前認知的時間
+    tz_tw = pytz.timezone('Asia/Taipei')
+    now_tw = datetime.now(tz_tw)
+    st.info(f"🇹🇼 台灣時間: {now_tw.strftime('%Y-%m-%d %H:%M')}")
+    
     if st.button("🗑️ 強制清除快取 (重抓數據)"):
         st.cache_data.clear()
         st.rerun()
@@ -81,7 +88,7 @@ def get_monthly_data(df):
 # ==========================================
 # 2. Live 面板數據與邏輯
 # ==========================================
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=300) # 數據下載可以緩存短時間 (5分鐘)
 def get_live_data():
     tickers = list(MAPPING.keys()) + list(MAPPING.values()) + SAFE_POOL
     try:
@@ -104,7 +111,8 @@ def get_live_data():
         st.error(f"數據下載失敗: {e}")
         return pd.DataFrame()
 
-@st.cache_data(ttl=3600)
+# [重要修正] 移除 @st.cache_data
+# 因為此函式依賴 "當前時間" 進行邏輯判斷，若開啟緩存，Streamlit 會忽略內部的時間檢查
 def calculate_live_risk(data):
     if data.empty: return {}
     
@@ -166,7 +174,7 @@ def calculate_live_risk(data):
         except: continue
     return risk_details
 
-@st.cache_data(ttl=3600)
+# [重要修正] 移除 @st.cache_data，確保每次執行都重新檢查時間
 def calculate_live_selection(data):
     if data.empty: return pd.DataFrame(), None
     
@@ -180,22 +188,24 @@ def calculate_live_selection(data):
 
     last_date = data.index[-1]
     
-    # [FIX] 強制使用 UTC+8 (台灣時間) 進行跨月判定
-    # GitHub Server 是 UTC+0，現在是 UTC 1/2 早上，但如果快取或時間差有誤會導致判定失敗
-    # 這裡直接用 UTC 時間 + 8 小時來模擬台灣時間
-    now_tw = datetime.utcnow() + timedelta(hours=8)
+    # [FIX] 強制使用 UTC+8 (台灣時間)
+    tz_tw = pytz.timezone('Asia/Taipei')
+    now_tw = datetime.now(tz_tw)
     
+    # 轉換為 Period 物件 (月)
+    # 注意：last_date 通常沒有時區，我們只取其年月，不影響比較
     last_data_period = last_date.to_period('M')
-    current_tw_period = pd.Period(now_tw, freq='M')
+    
+    # 系統當前月份
+    current_tw_period = pd.Period(now_tw.strftime('%Y-%m'), freq='M')
 
-    # 邏輯：
-    # 1. 數據最後一筆是 12/31 (Period: 2025-12)
-    # 2. 現在台灣時間是 1/2 (Period: 2026-01)
-    # 3. 2025-12 < 2026-01 為 True -> 代表 12月已過完 -> 取 monthly 最後一筆 (12/31)
+    # 邏輯核心：
+    # 如果數據最後一個月 (例如 2025-12) 小於 當前台灣時間月份 (例如 2026-01)
+    # 則代表 2025-12 已經是過去式，可以直接取用
     if last_data_period < current_tw_period:
         ref_date = monthly.index[-1]
     else:
-        # 尚未跨月，取上個月底
+        # 如果還在同月份，則取上個月
         prev_months = monthly[monthly.index.to_period('M') < last_data_period]
         if prev_months.empty: return pd.DataFrame(), None
         ref_date = prev_months.index[-1]
@@ -242,7 +252,7 @@ def calculate_live_selection(data):
     df['Total_Z'] = z_sum
     return df.sort_values('Total_Z', ascending=False), ref_date
 
-@st.cache_data(ttl=3600)
+# [重要修正] 移除 @st.cache_data
 def calculate_live_safe(data):
     if data.empty: return "TLT", pd.DataFrame(), None
     
@@ -255,10 +265,11 @@ def calculate_live_safe(data):
     last_date = data.index[-1]
     
     # [FIX] 強制使用 UTC+8 (台灣時間)
-    now_tw = datetime.utcnow() + timedelta(hours=8)
+    tz_tw = pytz.timezone('Asia/Taipei')
+    now_tw = datetime.now(tz_tw)
     
     last_data_period = last_date.to_period('M')
-    current_tw_period = pd.Period(now_tw, freq='M')
+    current_tw_period = pd.Period(now_tw.strftime('%Y-%m'), freq='M')
 
     if last_data_period < current_tw_period:
         ref_date = monthly.index[-1]
@@ -280,6 +291,7 @@ def calculate_live_safe(data):
 # ==========================================
 # 3. 回測邏輯 (Strict Rolling)
 # ==========================================
+# 回測計算量大，且邏輯相對靜態，可以保留 cache
 @st.cache_data(ttl=3600, show_spinner="準備回測數據 (合成三倍槓桿)...")
 def get_synthetic_backtest_data():
     tickers = list(MAPPING.values()) + SAFE_POOL + ['VT']
@@ -506,7 +518,10 @@ with st.expander("🛠️ 數據除錯與狀態 (若數據為 N/A 請點此)"):
     st.write("原始數據形狀:", live_data.shape)
     st.write("包含欄位:", live_data.columns.tolist())
     st.write("最後更新日期:", live_data.index[-1] if not live_data.empty else "無")
-    st.write("系統時間 (Taiwan):", datetime.utcnow() + timedelta(hours=8))
+    
+    tz_tw = pytz.timezone('Asia/Taipei')
+    st.write("系統時間 (Taiwan):", datetime.now(tz_tw))
+    
     if live_data.empty:
         st.error("⚠️ 警告：無法下載數據，請檢查網路連線或 Yahoo Finance 狀態。")
     else:
