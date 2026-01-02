@@ -33,6 +33,15 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
+# [新增] 快取管理工具
+# ==========================================
+with st.sidebar:
+    st.write("🔧 系統工具")
+    if st.button("🗑️ 強制清除快取 (重抓數據)"):
+        st.cache_data.clear()
+        st.rerun()
+
+# ==========================================
 # 1. 核心參數
 # ==========================================
 MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"} 
@@ -171,16 +180,22 @@ def calculate_live_selection(data):
 
     last_date = data.index[-1]
     
-    # [FIX] 判斷是否為「跨月時刻」
-    # 邏輯：比較「數據的最後月份」與「現在系統時間的月份」
+    # [FIX] 強制使用 UTC+8 (台灣時間) 進行跨月判定
+    # GitHub Server 是 UTC+0，現在是 UTC 1/2 早上，但如果快取或時間差有誤會導致判定失敗
+    # 這裡直接用 UTC 時間 + 8 小時來模擬台灣時間
+    now_tw = datetime.utcnow() + timedelta(hours=8)
+    
     last_data_period = last_date.to_period('M')
-    current_sys_period = pd.Timestamp.now().to_period('M')
+    current_tw_period = pd.Period(now_tw, freq='M')
 
-    if last_data_period < current_sys_period:
-        # 如果數據還在12月，但系統時間已經是1月，代表12月已經結束，可以直接用12月底的數據
+    # 邏輯：
+    # 1. 數據最後一筆是 12/31 (Period: 2025-12)
+    # 2. 現在台灣時間是 1/2 (Period: 2026-01)
+    # 3. 2025-12 < 2026-01 為 True -> 代表 12月已過完 -> 取 monthly 最後一筆 (12/31)
+    if last_data_period < current_tw_period:
         ref_date = monthly.index[-1]
     else:
-        # 如果還在同一個月(例如月中)，則必須排除當前未完成的月份
+        # 尚未跨月，取上個月底
         prev_months = monthly[monthly.index.to_period('M') < last_data_period]
         if prev_months.empty: return pd.DataFrame(), None
         ref_date = prev_months.index[-1]
@@ -190,7 +205,7 @@ def calculate_live_selection(data):
     for ticker in prices.columns:
         row = {'Ticker': ticker}
         try:
-            # 確保 ref_date 在 monthly 中存在 (雖然是從 monthly 取出的，但做個保險)
+            # 確保 ref_date 存在
             if ref_date not in monthly.index: continue
             
             p_now = monthly.loc[ref_date, ticker]
@@ -239,11 +254,13 @@ def calculate_live_safe(data):
 
     last_date = data.index[-1]
     
-    # [FIX] 判斷是否為「跨月時刻」 (同上邏輯)
+    # [FIX] 強制使用 UTC+8 (台灣時間)
+    now_tw = datetime.utcnow() + timedelta(hours=8)
+    
     last_data_period = last_date.to_period('M')
-    current_sys_period = pd.Timestamp.now().to_period('M')
+    current_tw_period = pd.Period(now_tw, freq='M')
 
-    if last_data_period < current_sys_period:
+    if last_data_period < current_tw_period:
         ref_date = monthly.index[-1]
     else:
         prev_months = monthly[monthly.index.to_period('M') < last_data_period]
@@ -489,6 +506,7 @@ with st.expander("🛠️ 數據除錯與狀態 (若數據為 N/A 請點此)"):
     st.write("原始數據形狀:", live_data.shape)
     st.write("包含欄位:", live_data.columns.tolist())
     st.write("最後更新日期:", live_data.index[-1] if not live_data.empty else "無")
+    st.write("系統時間 (Taiwan):", datetime.utcnow() + timedelta(hours=8))
     if live_data.empty:
         st.error("⚠️ 警告：無法下載數據，請檢查網路連線或 Yahoo Finance 狀態。")
     else:
