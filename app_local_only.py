@@ -7,7 +7,9 @@ from arch import arch_model
 from collections import defaultdict
 from datetime import datetime, timedelta
 import warnings
-import pytz # 引入時區庫以確保萬無一失
+import pytz 
+import requests
+import time
 
 # ==========================================
 # 0. 頁面設定
@@ -34,15 +36,17 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# [新增] 快取管理與時間診斷工具 (側邊欄)
+# [新增] 快取管理與時間診斷工具
 # ==========================================
 with st.sidebar:
-    st.write("🔧 系統工具")
+    st.header("🔧 系統診斷")
     
-    # 顯示系統當前認知的時間
-    tz_tw = pytz.timezone('Asia/Taipei')
-    now_tw = datetime.now(tz_tw)
-    st.info(f"🇹🇼 台灣時間: {now_tw.strftime('%Y-%m-%d %H:%M')}")
+    try:
+        tz_tw = pytz.timezone('Asia/Taipei')
+        now_tw = datetime.now(tz_tw)
+        st.info(f"🇹🇼 台灣時間: {now_tw.strftime('%Y-%m-%d %H:%M')}")
+    except Exception as e:
+        st.error(f"時區錯誤: {e}")
     
     if st.button("🗑️ 強制清除快取 (重抓數據)"):
         st.cache_data.clear()
@@ -54,7 +58,6 @@ with st.sidebar:
 MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"} 
 SAFE_POOL = ["GLD", "TLT"] 
 
-# 風控閾值 (Exit 0.99 / Entry 0.90)
 RISK_CONFIG = {
     "UPRO": {"exit_q": 0.99, "entry_q": 0.90},
     "EURL": {"exit_q": 0.99, "entry_q": 0.90},
@@ -62,10 +65,10 @@ RISK_CONFIG = {
 }
 
 # 策略參數
-SMA_MONTHS = 6               # 月均線
-LIVE_GARCH_WINDOW = 504      # Live GARCH 窗口
-BACKTEST_GARCH_WINDOW = 504  # 回測 GARCH 窗口
-REFIT_STEP = 5               # 滾動重訓頻率
+SMA_MONTHS = 6               
+LIVE_GARCH_WINDOW = 504      
+BACKTEST_GARCH_WINDOW = 504  
+REFIT_STEP = 5               
 MOM_PERIODS = [3, 6, 9, 12]
 TRANSACTION_COST = 0.001 
 RF_RATE = 0.02 
@@ -76,7 +79,6 @@ def get_daily_leverage_cost(date):
     else: return 0.02 / 252
 
 def get_monthly_data(df):
-    """鎖定每個月實際最後交易日"""
     if df.empty: return df
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
@@ -86,40 +88,87 @@ def get_monthly_data(df):
     return df.loc[month_end_dates]
 
 # ==========================================
-# 2. Live 面板數據與邏輯
+# 2. Live 面板數據與邏輯 (強力重寫版)
 # ==========================================
-@st.cache_data(ttl=300) # 數據下載可以緩存短時間 (5分鐘)
+
+# [強力重寫] 使用 Session 偽裝 + 逐一下載 + 失敗重試機制
+@st.cache_data(ttl=300) 
 def get_live_data():
     tickers = list(MAPPING.keys()) + list(MAPPING.values()) + SAFE_POOL
-    try:
-        data = yf.download(tickers, period="5y", interval="1d", auto_adjust=True, progress=False, group_by='column')
-        
-        if isinstance(data.columns, pd.MultiIndex):
-            if 'Close' in data.columns.levels[0]:
-                data = data['Close']
+    
+    # 建立偽裝 Session
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    })
+
+    combined_data = pd.DataFrame()
+    
+    # 逐一下載，避免一顆老鼠屎壞了一鍋粥
+    for ticker in tickers:
+        try:
+            # 第一次嘗試：標準下載
+            df = yf.download(ticker, period="5y", interval="1d", auto_adjust=True, progress=False, session=session)
+            
+            # 如果下載失敗或為空，嘗試備用方案
+            if df.empty:
+                # 休息 0.5 秒避免被鎖 IP
+                time.sleep(0.5)
+                # 第二次嘗試：禁用多執行緒 (threads=False 往往能解決 Yahoo 鎖定問題)
+                df = yf.download(ticker, period="5y", interval="1d", auto_adjust=True, progress=False, session=session, threads=False)
+            
+            # 處理 MultiIndex (有些 ticker 會回傳 level 0，有些不會)
+            if isinstance(df.columns, pd.MultiIndex):
+                if 'Close' in df.columns.levels[0]:
+                    df = df['Close']
+                # 如果只有 Ticker 名稱在 Level 0 (例如 df['EDC'])
+                elif ticker in df.columns.levels[0]:
+                    df = df[ticker]
+            
+            # 如果原本就是單層 Index 但欄位名不是 ticker (通常是 'Close')
+            if 'Close' in df.columns:
+                df = df[['Close']].rename(columns={'Close': ticker})
+            elif ticker not in df.columns:
+                # 嘗試將第一欄當作數據
+                df.columns = [ticker]
+
+            # 移除時區
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+            
+            # 合併
+            if combined_data.empty:
+                combined_data = df
             else:
-                pass
+                combined_data = combined_data.join(df, how='outer')
+                
+        except Exception as e:
+            print(f"Failed to download {ticker}: {e}")
+            continue
 
-        if data.index.tz is not None:
-            data.index = data.index.tz_localize(None)
-
-        data = data.ffill()
-        data = data.dropna(how='all')
-        
-        return data
-    except Exception as e:
-        st.error(f"數據下載失敗: {e}")
+    if combined_data.empty:
+        st.error("⚠️ 所有數據下載失敗，請檢查網路狀態。")
         return pd.DataFrame()
 
-# [重要修正] 移除 @st.cache_data
-# 因為此函式依賴 "當前時間" 進行邏輯判斷，若開啟緩存，Streamlit 會忽略內部的時間檢查
+    # 數據清理
+    combined_data = combined_data.ffill()
+    combined_data = combined_data.dropna(how='all')
+    
+    return combined_data
+
+# 移除快取
 def calculate_live_risk(data):
     if data.empty: return {}
     
+    # 這裡我們必須嚴格要求 MAPPING keys (3x) 必須存在
     avail_cols = [c for c in list(MAPPING.keys()) if c in data.columns]
-    if not avail_cols: return {}
+    if not avail_cols: 
+        st.warning("⚠️ 無法取得進攻資產 (3x ETF) 數據，無法計算風險。")
+        return {}
     
-    monthly_prices = get_monthly_data(data[avail_cols])
+    # 計算 SMA 使用的是 1x ETF
+    sma_tickers = [c for c in list(MAPPING.values()) if c in data.columns]
+    monthly_prices = get_monthly_data(data[sma_tickers])
     monthly_sma = monthly_prices.rolling(SMA_MONTHS).mean()
     monthly_sig = (monthly_prices > monthly_sma).astype(float)
     daily_sma_sig = monthly_sig.reindex(data.index).ffill()
@@ -127,11 +176,14 @@ def calculate_live_risk(data):
     risk_details = {}
     for trade_t, signal_t in MAPPING.items():
         if signal_t not in data.columns: continue
-        if trade_t not in data.columns: 
-             series = data[signal_t] 
-        else:
-             series = data[trade_t]
-             
+        
+        # 如果這一行執行了，代表我們沒有放棄 EDC
+        if trade_t not in data.columns or data[trade_t].isnull().all():
+            # 只有在真的抓不到時才跳過，或者在這裡顯示錯誤
+            # 既然使用者不想要 Proxy，這裡我們就只能跳過
+            continue
+            
+        series = data[trade_t]
         ret = data[signal_t].pct_change() * 100
         
         # Live GARCH
@@ -146,13 +198,10 @@ def calculate_live_risk(data):
             df = pd.DataFrame({'Price': series, 'Ret': ret})
             df['Vol'] = pd.Series(cond_vol, index=window.index).reindex(df.index)
             
-            if trade_t in daily_sma_sig.columns:
-                df['SMA_State'] = daily_sma_sig[trade_t]
+            if signal_t in daily_sma_sig.columns:
+                df['SMA_State'] = daily_sma_sig[signal_t]
             else:
-                if MAPPING[trade_t] in daily_sma_sig.columns: 
-                    df['SMA_State'] = 1.0 
-                else:
-                    df['SMA_State'] = 0.0
+                df['SMA_State'] = 1.0 
             
             cfg = RISK_CONFIG[trade_t]
             df['Exit_Th'] = df['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
@@ -174,11 +223,12 @@ def calculate_live_risk(data):
         except: continue
     return risk_details
 
-# [重要修正] 移除 @st.cache_data，確保每次執行都重新檢查時間
+# 移除快取
 def calculate_live_selection(data):
     if data.empty: return pd.DataFrame(), None
     
-    avail_keys = [k for k in list(MAPPING.keys()) if k in data.columns]
+    # 嚴格只使用有數據的 3x ETF
+    avail_keys = [k for k in list(MAPPING.keys()) if k in data.columns and not data[k].isnull().all()]
     if not avail_keys: return pd.DataFrame(), None
     
     prices = data[avail_keys]
@@ -188,34 +238,28 @@ def calculate_live_selection(data):
 
     last_date = data.index[-1]
     
-    # [FIX] 強制使用 UTC+8 (台灣時間)
-    tz_tw = pytz.timezone('Asia/Taipei')
-    now_tw = datetime.now(tz_tw)
-    
-    # 轉換為 Period 物件 (月)
-    # 注意：last_date 通常沒有時區，我們只取其年月，不影響比較
-    last_data_period = last_date.to_period('M')
-    
-    # 系統當前月份
-    current_tw_period = pd.Period(now_tw.strftime('%Y-%m'), freq='M')
+    try:
+        tz_tw = pytz.timezone('Asia/Taipei')
+        now_tw = datetime.now(tz_tw)
+        
+        last_data_period = last_date.to_period('M')
+        current_tw_period = pd.Period(now_tw.strftime('%Y-%m'), freq='M')
 
-    # 邏輯核心：
-    # 如果數據最後一個月 (例如 2025-12) 小於 當前台灣時間月份 (例如 2026-01)
-    # 則代表 2025-12 已經是過去式，可以直接取用
-    if last_data_period < current_tw_period:
-        ref_date = monthly.index[-1]
-    else:
-        # 如果還在同月份，則取上個月
-        prev_months = monthly[monthly.index.to_period('M') < last_data_period]
-        if prev_months.empty: return pd.DataFrame(), None
-        ref_date = prev_months.index[-1]
+        if last_data_period < current_tw_period:
+            ref_date = monthly.index[-1]
+        else:
+            prev_months = monthly[monthly.index.to_period('M') < last_data_period]
+            if prev_months.empty: return pd.DataFrame(), None
+            ref_date = prev_months.index[-1]
+    except Exception as e:
+        st.error(f"日期計算錯誤: {e}")
+        return pd.DataFrame(), None
     
     metrics = []
     
     for ticker in prices.columns:
         row = {'Ticker': ticker}
         try:
-            # 確保 ref_date 存在
             if ref_date not in monthly.index: continue
             
             p_now = monthly.loc[ref_date, ticker]
@@ -252,7 +296,7 @@ def calculate_live_selection(data):
     df['Total_Z'] = z_sum
     return df.sort_values('Total_Z', ascending=False), ref_date
 
-# [重要修正] 移除 @st.cache_data
+# 移除快取
 def calculate_live_safe(data):
     if data.empty: return "TLT", pd.DataFrame(), None
     
@@ -264,19 +308,21 @@ def calculate_live_safe(data):
 
     last_date = data.index[-1]
     
-    # [FIX] 強制使用 UTC+8 (台灣時間)
-    tz_tw = pytz.timezone('Asia/Taipei')
-    now_tw = datetime.now(tz_tw)
-    
-    last_data_period = last_date.to_period('M')
-    current_tw_period = pd.Period(now_tw.strftime('%Y-%m'), freq='M')
+    try:
+        tz_tw = pytz.timezone('Asia/Taipei')
+        now_tw = datetime.now(tz_tw)
+        
+        last_data_period = last_date.to_period('M')
+        current_tw_period = pd.Period(now_tw.strftime('%Y-%m'), freq='M')
 
-    if last_data_period < current_tw_period:
-        ref_date = monthly.index[-1]
-    else:
-        prev_months = monthly[monthly.index.to_period('M') < last_data_period]
-        if prev_months.empty: return "TLT", pd.DataFrame(), None
-        ref_date = prev_months.index[-1]
+        if last_data_period < current_tw_period:
+            ref_date = monthly.index[-1]
+        else:
+            prev_months = monthly[monthly.index.to_period('M') < last_data_period]
+            if prev_months.empty: return "TLT", pd.DataFrame(), None
+            ref_date = prev_months.index[-1]
+    except:
+        return "TLT", pd.DataFrame(), None
     
     loc = monthly.index.get_loc(ref_date)
     
@@ -291,7 +337,6 @@ def calculate_live_safe(data):
 # ==========================================
 # 3. 回測邏輯 (Strict Rolling)
 # ==========================================
-# 回測計算量大，且邏輯相對靜態，可以保留 cache
 @st.cache_data(ttl=3600, show_spinner="準備回測數據 (合成三倍槓桿)...")
 def get_synthetic_backtest_data():
     tickers = list(MAPPING.values()) + SAFE_POOL + ['VT']
@@ -411,14 +456,11 @@ def calculate_backtest_signals_rolling(data):
 
 def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
     dates = data.index
-    # 起始點: GARCH窗口(504) + Quantile窗口(252) = 756
     start_idx = BACKTEST_GARCH_WINDOW + 252
     
-    # 檢查 VT 上市時間，避免回測早期 VT 數據為空
     vt_start = data['VT'].first_valid_index()
     if vt_start:
         vt_idx = data.index.get_loc(vt_start)
-        # 取最大值，確保數據與模型皆已備妥
         start_idx = max(start_idx, vt_idx)
     
     if start_idx >= len(dates): return None, None, None, None
@@ -428,12 +470,10 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
     hold_counts = defaultdict(float)
     prev_pos = {}
     
-    # Daily Loop
     for i in range(start_idx, len(dates)):
         today = dates[i]
         yesterday = dates[i-1]
         
-        # Monthly Selection
         past_wins = winners_series[winners_series.index <= yesterday]
         if past_wins.empty: continue
         target_risky = past_wins.iloc[-1]
@@ -442,14 +482,12 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
         if past_safe.empty: target_safe = 'TLT'
         else: target_safe = past_safe.iloc[-1]
         
-        # Weight
         if target_risky in risk_weights.columns and yesterday in risk_weights.index:
             w_risk = risk_weights.loc[yesterday, target_risky]
             if pd.isna(w_risk): w_risk = 0.0
         else: w_risk = 0.0
         w_safe = 1.0 - w_risk
         
-        # Calc
         curr_pos = {}
         if w_risk > 0: curr_pos[target_risky] = w_risk
         if w_safe > 0: curr_pos[target_safe] = w_safe
@@ -476,7 +514,6 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
         strategy_ret.append(day_ret - cost)
         valid_dates.append(today)
         
-        # 記錄持倉以計算 Time in 3x
         hold_counts[target_risky] += w_risk
         hold_counts[target_safe] += w_safe
         
@@ -485,7 +522,6 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
     eq = pd.Series(strategy_ret, index=valid_dates)
     cum_eq = (1 + eq).cumprod()
     
-    # Benchmarks
     b_cols = [c for c in list(MAPPING.keys()) if c in data.columns]
     b_sub = data[b_cols].loc[valid_dates].copy()
     b_eq = pd.Series(1.0, index=b_sub.index)
@@ -509,23 +545,29 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
 # ==========================================
 # 4. Dashboard 介面
 # ==========================================
-st.title("🛡️ 雙重動能與動態風控 (Live + Rolling Backtest)")
+st.title("🛡️ 雙重動能與動態風控 (v2026.01.02 - EDC Fix)")
 st.caption(f"配置: SMA {SMA_MONTHS}M (Monthly) / GARCH (Q{RISK_CONFIG['UPRO']['exit_q']*100:.0f}) / Safe (GLD/TLT)")
 
-# --- Debug Panel (隱藏式) ---
 with st.expander("🛠️ 數據除錯與狀態 (若數據為 N/A 請點此)"):
     live_data = get_live_data()
     st.write("原始數據形狀:", live_data.shape)
-    st.write("包含欄位:", live_data.columns.tolist())
+    
+    # 檢查 EDC 是否在 columns
+    has_edc = 'EDC' in live_data.columns
+    st.write(f"EDC 數據狀態: {'✅ 成功抓取' if has_edc else '❌ 缺失'}")
+    
     st.write("最後更新日期:", live_data.index[-1] if not live_data.empty else "無")
     
-    tz_tw = pytz.timezone('Asia/Taipei')
-    st.write("系統時間 (Taiwan):", datetime.now(tz_tw))
+    try:
+        tz_tw = pytz.timezone('Asia/Taipei')
+        st.write("系統時間 (Taiwan):", datetime.now(tz_tw))
+    except:
+        st.write("系統時間: 本地時區庫未加載")
     
     if live_data.empty:
-        st.error("⚠️ 警告：無法下載數據，請檢查網路連線或 Yahoo Finance 狀態。")
+        st.error("⚠️ 警告：所有數據下載失敗。")
     else:
-        st.success("✅ 數據下載正常")
+        st.success("✅ 數據下載流程完成")
 
 # --- Live Data Loading ---
 risk_live = calculate_live_risk(live_data)
@@ -542,7 +584,7 @@ else:
     g_state = 0.0
 
 if sel_date:
-    st.info(f"🔒 **訊號鎖定日**: {sel_date.strftime('%Y-%m-%d')} (上個月最後交易日)")
+    st.info(f"🔒 **訊號鎖定日**: {sel_date.strftime('%Y-%m-%d')} (根據 {sel_date.strftime('%Y-%m')} 月底收盤)")
 
 with st.expander("📖 策略詳細規則", expanded=False):
     st.markdown(r"""
