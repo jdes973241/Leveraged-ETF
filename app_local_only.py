@@ -170,19 +170,31 @@ def calculate_live_selection(data):
     if monthly.empty: return pd.DataFrame(), None
 
     last_date = data.index[-1]
-    current_period = last_date.to_period('M')
-    prev_months = monthly[monthly.index.to_period('M') < current_period]
-    if prev_months.empty: return pd.DataFrame(), None
     
-    ref_date = prev_months.index[-1]
+    # [FIX] 判斷是否為「跨月時刻」
+    # 邏輯：比較「數據的最後月份」與「現在系統時間的月份」
+    last_data_period = last_date.to_period('M')
+    current_sys_period = pd.Timestamp.now().to_period('M')
+
+    if last_data_period < current_sys_period:
+        # 如果數據還在12月，但系統時間已經是1月，代表12月已經結束，可以直接用12月底的數據
+        ref_date = monthly.index[-1]
+    else:
+        # 如果還在同一個月(例如月中)，則必須排除當前未完成的月份
+        prev_months = monthly[monthly.index.to_period('M') < last_data_period]
+        if prev_months.empty: return pd.DataFrame(), None
+        ref_date = prev_months.index[-1]
+    
     metrics = []
     
     for ticker in prices.columns:
         row = {'Ticker': ticker}
         try:
+            # 確保 ref_date 在 monthly 中存在 (雖然是從 monthly 取出的，但做個保險)
+            if ref_date not in monthly.index: continue
+            
             p_now = monthly.loc[ref_date, ticker]
             for m in MOM_PERIODS:
-                if ref_date not in monthly.index: continue
                 loc = monthly.index.get_loc(ref_date)
                 
                 if loc >= m:
@@ -226,11 +238,18 @@ def calculate_live_safe(data):
     if monthly.empty: return "TLT", pd.DataFrame(), None
 
     last_date = data.index[-1]
-    current_period = last_date.to_period('M')
-    prev_months = monthly[monthly.index.to_period('M') < current_period]
-    if prev_months.empty: return "TLT", pd.DataFrame(), None
     
-    ref_date = prev_months.index[-1]
+    # [FIX] 判斷是否為「跨月時刻」 (同上邏輯)
+    last_data_period = last_date.to_period('M')
+    current_sys_period = pd.Timestamp.now().to_period('M')
+
+    if last_data_period < current_sys_period:
+        ref_date = monthly.index[-1]
+    else:
+        prev_months = monthly[monthly.index.to_period('M') < last_data_period]
+        if prev_months.empty: return "TLT", pd.DataFrame(), None
+        ref_date = prev_months.index[-1]
+    
     loc = monthly.index.get_loc(ref_date)
     
     if loc >= 12:
@@ -665,8 +684,6 @@ if not syn_data.empty:
             with m4: m_box("Avg 5Y", r5_s, r5_b, r5_v)
             with m5: m_box("MaxDD", s_s[3], b_s[3], v_s[3])
             
-            # [FIX] Time in 3x 修正邏輯
-            # holds 的 key 是 3x ticker 名稱 (e.g. UPRO, EURL)，檢查 key 是否在 MAPPING 中
             risky_hold_sum = sum([v for k,v in holds.items() if k in MAPPING.keys()])
             t_3x = risky_hold_sum / len(s_eq)
             with m6: m_box("Time in 3x", t_3x, 1.0, 1.0)
