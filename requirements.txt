@@ -7,3 +7,4 @@ arch
 tabulate
 tqdm
 pytz
+pandas_datareader
