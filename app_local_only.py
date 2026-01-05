@@ -8,13 +8,11 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 import warnings
 import pytz 
-import requests
-import time
 
 # ==========================================
 # 0. 頁面設定
 # ==========================================
-st.set_page_config(page_title="Dynamic Momentum Strategy (Robust)", layout="wide")
+st.set_page_config(page_title="Dynamic Momentum Strategy (Standard)", layout="wide")
 warnings.simplefilter(action='ignore')
 alt.data_transformers.disable_max_rows()
 
@@ -58,7 +56,7 @@ with st.sidebar:
 MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"} 
 SAFE_POOL = ["GLD", "TLT"] 
 
-# 風控閾值 (Exit 0.99 / Entry 0.90)
+# 風控閾值
 RISK_CONFIG = {
     "UPRO": {"exit_q": 0.99, "entry_q": 0.90},
     "EURL": {"exit_q": 0.99, "entry_q": 0.90},
@@ -66,10 +64,10 @@ RISK_CONFIG = {
 }
 
 # 策略參數
-SMA_MONTHS = 6               # 月均線
-LIVE_GARCH_WINDOW = 504      # Live GARCH 窗口
-BACKTEST_GARCH_WINDOW = 504  # 回測 GARCH 窗口
-REFIT_STEP = 5               # 滾動重訓頻率
+SMA_MONTHS = 6               
+LIVE_GARCH_WINDOW = 504      
+BACKTEST_GARCH_WINDOW = 504  
+REFIT_STEP = 5               
 MOM_PERIODS = [3, 6, 9, 12]
 TRANSACTION_COST = 0.001 
 RF_RATE = 0.02 
@@ -80,7 +78,6 @@ def get_daily_leverage_cost(date):
     else: return 0.02 / 252
 
 def get_monthly_data(df):
-    """鎖定每個月實際最後交易日"""
     if df.empty: return df
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
@@ -90,98 +87,75 @@ def get_monthly_data(df):
     return df.loc[month_end_dates]
 
 # ==========================================
-# 2. Live 面板數據與邏輯 (抗封鎖增強版)
+# 2. Live 面板數據與邏輯 (回歸標準版)
 # ==========================================
 @st.cache_data(ttl=300) 
 def get_live_data():
     tickers = list(MAPPING.keys()) + list(MAPPING.values()) + SAFE_POOL
-    combined_data = pd.DataFrame()
     
-    # 設置更完整的 Header 偽裝，讓 Yahoo 認為這是瀏覽器行為
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-    })
+    try:
+        # [關鍵修正] 
+        # 1. 使用標準 download，不加任何 headers (讓庫自己處理)
+        # 2. threads=False: 這是 Streamlit Cloud 成功的關鍵，避免同時開啟太多連線被擋
+        # 3. group_by='ticker': 讓回傳格式固定為 (Price, Ticker)
+        data = yf.download(
+            tickers, 
+            period="5y", 
+            interval="1d", 
+            auto_adjust=True, 
+            progress=False, 
+            threads=False,  # <--- 最重要的參數
+            group_by='ticker' 
+        )
+        
+        if data.empty:
+            return pd.DataFrame()
 
-    status_container = st.empty() # 用於顯示進度
-    success_count = 0
-
-    for i, ticker in enumerate(tickers):
-        # status_container.text(f"正在下載: {ticker} ({i+1}/{len(tickers)})...")
-        df = pd.DataFrame()
-        try:
-            # 策略 A: 使用 Ticker 物件直接抓取 (通常最穩定)
-            t_obj = yf.Ticker(ticker, session=session)
-            df = t_obj.history(period="5y", interval="1d", auto_adjust=True)
-            
-            # 策略 B: 如果 A 失敗，使用標準 download
-            if df.empty:
-                time.sleep(0.3) # 稍微休息
-                df = yf.download(ticker, period="5y", interval="1d", auto_adjust=True, progress=False, session=session)
-            
-            # 策略 C: 禁用多線程 (最後手段，解決 IP 封鎖)
-            if df.empty:
-                time.sleep(0.5)
-                df = yf.download(ticker, period="5y", interval="1d", auto_adjust=True, progress=False, threads=False)
-
-            # 數據驗證與格式化
-            if not df.empty:
-                # 處理 MultiIndex (yfinance 版本差異導致)
-                if isinstance(df.columns, pd.MultiIndex):
-                    if 'Close' in df.columns.levels[0]: 
-                        df = df['Close']
-                    elif ticker in df.columns.levels[0]: 
-                        df = df[ticker]
+        # [數據清洗] 將 MultiIndex 轉為單層 DataFrame (只取 Close)
+        # yfinance 的 group_by='ticker' 會回傳:
+        # Columns: (EDC, Close), (EDC, Open)... (SPY, Close)...
+        
+        clean_df = pd.DataFrame(index=data.index)
+        
+        for t in tickers:
+            try:
+                # 嘗試提取收盤價
+                if t in data.columns:
+                    # 如果該 ticker 有數據，提取 Close
+                    # 注意：yfinance 有時回傳 'Close' 有時回傳 'Price' (視 auto_adjust 而定)
+                    # 這裡做一個防呆檢查
+                    ticker_df = data[t]
+                    if 'Close' in ticker_df.columns:
+                        clean_df[t] = ticker_df['Close']
+                    elif 'Price' in ticker_df.columns: # 新版 yfinance 可能用 Price
+                        clean_df[t] = ticker_df['Price']
+                    else:
+                        # 嘗試抓第一欄
+                        clean_df[t] = ticker_df.iloc[:, 0]
+            except Exception:
+                pass
                 
-                # 處理單層 Index 但名稱不對
-                if 'Close' in df.columns:
-                    df = df[['Close']].rename(columns={'Close': ticker})
-                elif len(df.columns) == 1:
-                    df.columns = [ticker]
-                
-                # 移除時區 (避免合併錯誤)
-                if df.index.tz is not None:
-                    df.index = df.index.tz_localize(None)
+        # 移除時區
+        if clean_df.index.tz is not None:
+            clean_df.index = clean_df.index.tz_localize(None)
 
-                # 合併數據
-                if combined_data.empty:
-                    combined_data = df
-                else:
-                    combined_data = combined_data.join(df, how='outer')
-                
-                success_count += 1
-            else:
-                print(f"❌ {ticker}: Data Empty")
+        # 簡單的向前填充
+        clean_df = clean_df.ffill()
+        
+        return clean_df
 
-        except Exception as e:
-            print(f"❌ {ticker}: Download Error {e}")
-            continue
-    
-    status_container.empty() # 清除進度顯示
-
-    # 最終檢查
-    if combined_data.empty:
-        st.error(f"⚠️ 嚴重錯誤：無法下載任何數據 (成功抓取數: {success_count}/{len(tickers)})。可能原因：IP 被鎖或 yfinance 版本過舊。")
+    except Exception as e:
+        st.error(f"數據下載失敗: {e}")
         return pd.DataFrame()
 
-    # 數據清理 (填充與去空)
-    combined_data = combined_data.ffill()
-    combined_data = combined_data.dropna(how='all')
-    
-    return combined_data
-
-# 移除快取，確保時間邏輯每次執行
+# 移除快取
 def calculate_live_risk(data):
     if data.empty: return {}
     
     avail_cols = [c for c in list(MAPPING.keys()) if c in data.columns]
     if not avail_cols: return {}
     
-    # 計算 SMA 使用的是 1x ETF (SPY, VGK, EEM)
+    # 計算 SMA 使用的是 1x ETF
     sma_tickers = [c for c in list(MAPPING.values()) if c in data.columns]
     monthly_prices = get_monthly_data(data[sma_tickers])
     monthly_sma = monthly_prices.rolling(SMA_MONTHS).mean()
@@ -192,7 +166,7 @@ def calculate_live_risk(data):
     for trade_t, signal_t in MAPPING.items():
         if signal_t not in data.columns: continue
         
-        # 使用者要求：必須要有真實數據才計算，不使用 Proxy
+        # 這裡不使用 Proxy，如果 3x 真的沒抓到，就不顯示該資產
         if trade_t not in data.columns or data[trade_t].isnull().all():
             continue
             
@@ -236,7 +210,7 @@ def calculate_live_risk(data):
         except: continue
     return risk_details
 
-# 移除快取，確保時間邏輯每次執行
+# 移除快取
 def calculate_live_selection(data):
     if data.empty: return pd.DataFrame(), None
     
@@ -251,13 +225,11 @@ def calculate_live_selection(data):
 
     last_date = data.index[-1]
     
-    # [FIX] 強制使用 UTC+8 (台灣時間)
     try:
         tz_tw = pytz.timezone('Asia/Taipei')
         now_tw = datetime.now(tz_tw)
         
         last_data_period = last_date.to_period('M')
-        # 使用 strftime 確保格式正確再轉 Period
         current_tw_period = pd.Period(now_tw.strftime('%Y-%m'), freq='M')
 
         if last_data_period < current_tw_period:
@@ -311,7 +283,7 @@ def calculate_live_selection(data):
     df['Total_Z'] = z_sum
     return df.sort_values('Total_Z', ascending=False), ref_date
 
-# 移除快取，確保時間邏輯每次執行
+# 移除快取
 def calculate_live_safe(data):
     if data.empty: return "TLT", pd.DataFrame(), None
     
@@ -356,8 +328,8 @@ def calculate_live_safe(data):
 def get_synthetic_backtest_data():
     tickers = list(MAPPING.values()) + SAFE_POOL + ['VT']
     try:
-        # 回測數據通常較大，使用標準下載即可，若失敗則回傳空
-        data_raw = yf.download(tickers, period="max", interval="1d", auto_adjust=True, progress=False)
+        # [關鍵修正] 回測下載也使用 threads=False 確保成功
+        data_raw = yf.download(tickers, period="max", interval="1d", auto_adjust=True, progress=False, threads=False)
         
         if isinstance(data_raw.columns, pd.MultiIndex):
             if 'Close' in data_raw.columns.levels[0]: data_raw = data_raw['Close']
@@ -472,14 +444,11 @@ def calculate_backtest_signals_rolling(data):
 
 def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
     dates = data.index
-    # 起始點: GARCH窗口(504) + Quantile窗口(252) = 756
     start_idx = BACKTEST_GARCH_WINDOW + 252
     
-    # 檢查 VT 上市時間，避免回測早期 VT 數據為空
     vt_start = data['VT'].first_valid_index()
     if vt_start:
         vt_idx = data.index.get_loc(vt_start)
-        # 取最大值，確保數據與模型皆已備妥
         start_idx = max(start_idx, vt_idx)
     
     if start_idx >= len(dates): return None, None, None, None
@@ -489,12 +458,10 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
     hold_counts = defaultdict(float)
     prev_pos = {}
     
-    # Daily Loop
     for i in range(start_idx, len(dates)):
         today = dates[i]
         yesterday = dates[i-1]
         
-        # Monthly Selection
         past_wins = winners_series[winners_series.index <= yesterday]
         if past_wins.empty: continue
         target_risky = past_wins.iloc[-1]
@@ -503,14 +470,12 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
         if past_safe.empty: target_safe = 'TLT'
         else: target_safe = past_safe.iloc[-1]
         
-        # Weight
         if target_risky in risk_weights.columns and yesterday in risk_weights.index:
             w_risk = risk_weights.loc[yesterday, target_risky]
             if pd.isna(w_risk): w_risk = 0.0
         else: w_risk = 0.0
         w_safe = 1.0 - w_risk
         
-        # Calc
         curr_pos = {}
         if w_risk > 0: curr_pos[target_risky] = w_risk
         if w_safe > 0: curr_pos[target_safe] = w_safe
@@ -537,7 +502,6 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
         strategy_ret.append(day_ret - cost)
         valid_dates.append(today)
         
-        # 記錄持倉以計算 Time in 3x
         hold_counts[target_risky] += w_risk
         hold_counts[target_safe] += w_safe
         
@@ -546,7 +510,6 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
     eq = pd.Series(strategy_ret, index=valid_dates)
     cum_eq = (1 + eq).cumprod()
     
-    # Benchmarks
     b_cols = [c for c in list(MAPPING.keys()) if c in data.columns]
     b_sub = data[b_cols].loc[valid_dates].copy()
     b_eq = pd.Series(1.0, index=b_sub.index)
@@ -570,10 +533,9 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
 # ==========================================
 # 4. Dashboard 介面
 # ==========================================
-st.title("🛡️ 雙重動能與動態風控 (v2026.01.02 - Robust)")
+st.title("🛡️ 雙重動能與動態風控 (Standard Fix)")
 st.caption(f"配置: SMA {SMA_MONTHS}M (Monthly) / GARCH (Q{RISK_CONFIG['UPRO']['exit_q']*100:.0f}) / Safe (GLD/TLT)")
 
-# --- Debug Panel (隱藏式) ---
 with st.expander("🛠️ 數據除錯與狀態 (若數據為 N/A 請點此)"):
     live_data = get_live_data()
     st.write("原始數據形狀:", live_data.shape)
