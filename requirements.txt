@@ -1,10 +1,7 @@
 streamlit
-yfinance
+yfinance>=0.2.36
 pandas
 numpy
 altair
 arch
-tabulate
-tqdm
 pytz
-pandas_datareader
