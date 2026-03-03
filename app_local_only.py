@@ -94,54 +94,38 @@ def get_live_data():
     tickers = list(MAPPING.keys()) + list(MAPPING.values()) + SAFE_POOL
     
     try:
-        # [關鍵修正] 
-        # 1. 使用標準 download，不加任何 headers (讓庫自己處理)
-        # 2. threads=False: 這是 Streamlit Cloud 成功的關鍵，避免同時開啟太多連線被擋
-        # 3. group_by='ticker': 讓回傳格式固定為 (Price, Ticker)
         data = yf.download(
             tickers, 
             period="5y", 
             interval="1d", 
             auto_adjust=True, 
             progress=False, 
-            threads=False,  # <--- 最重要的參數
+            threads=False, 
             group_by='ticker' 
         )
         
         if data.empty:
             return pd.DataFrame()
 
-        # [數據清洗] 將 MultiIndex 轉為單層 DataFrame (只取 Close)
-        # yfinance 的 group_by='ticker' 會回傳:
-        # Columns: (EDC, Close), (EDC, Open)... (SPY, Close)...
-        
         clean_df = pd.DataFrame(index=data.index)
         
         for t in tickers:
             try:
-                # 嘗試提取收盤價
                 if t in data.columns:
-                    # 如果該 ticker 有數據，提取 Close
-                    # 注意：yfinance 有時回傳 'Close' 有時回傳 'Price' (視 auto_adjust 而定)
-                    # 這裡做一個防呆檢查
                     ticker_df = data[t]
                     if 'Close' in ticker_df.columns:
                         clean_df[t] = ticker_df['Close']
-                    elif 'Price' in ticker_df.columns: # 新版 yfinance 可能用 Price
+                    elif 'Price' in ticker_df.columns: 
                         clean_df[t] = ticker_df['Price']
                     else:
-                        # 嘗試抓第一欄
                         clean_df[t] = ticker_df.iloc[:, 0]
             except Exception:
                 pass
                 
-        # 移除時區
         if clean_df.index.tz is not None:
             clean_df.index = clean_df.index.tz_localize(None)
 
-        # 簡單的向前填充
         clean_df = clean_df.ffill()
-        
         return clean_df
 
     except Exception as e:
@@ -155,7 +139,6 @@ def calculate_live_risk(data):
     avail_cols = [c for c in list(MAPPING.keys()) if c in data.columns]
     if not avail_cols: return {}
     
-    # 計算 SMA 使用的是 1x ETF
     sma_tickers = [c for c in list(MAPPING.values()) if c in data.columns]
     monthly_prices = get_monthly_data(data[sma_tickers])
     monthly_sma = monthly_prices.rolling(SMA_MONTHS).mean()
@@ -165,25 +148,29 @@ def calculate_live_risk(data):
     risk_details = {}
     for trade_t, signal_t in MAPPING.items():
         if signal_t not in data.columns: continue
-        
-        # 這裡不使用 Proxy，如果 3x 真的沒抓到，就不顯示該資產
         if trade_t not in data.columns or data[trade_t].isnull().all():
             continue
             
         series = data[trade_t]
         ret = data[signal_t].pct_change() * 100
         
-        # Live GARCH
         window = ret.dropna().tail(LIVE_GARCH_WINDOW * 2) 
         if len(window) < 100: continue
         
         try:
             am = arch_model(window, vol='Garch', p=1, q=1, dist='t', rescale=False)
             res = am.fit(disp='off', show_warning=False)
-            cond_vol = res.conditional_volatility * np.sqrt(252)
+            
+            # [時序修正]: 提取樣本內預測與一步向前樣本外預測
+            in_sample_vol = res.conditional_volatility * np.sqrt(252)
+            fc = res.forecast(horizon=1, reindex=False)
+            next_vol = np.sqrt(fc.variance.iloc[-1].values[0]) * np.sqrt(252)
+            
+            # 將波動率向左對齊：Vol[t] 等於預測明日 t+1 的波動率
+            vol_aligned = np.append(in_sample_vol.values[1:], next_vol)
             
             df = pd.DataFrame({'Price': series, 'Ret': ret})
-            df['Vol'] = pd.Series(cond_vol, index=window.index).reindex(df.index)
+            df['Vol'] = pd.Series(vol_aligned, index=window.index).reindex(df.index)
             
             if signal_t in daily_sma_sig.columns:
                 df['SMA_State'] = daily_sma_sig[signal_t]
@@ -214,7 +201,6 @@ def calculate_live_risk(data):
 def calculate_live_selection(data):
     if data.empty: return pd.DataFrame(), None
     
-    # 嚴格只使用有數據的 3x ETF
     avail_keys = [k for k in list(MAPPING.keys()) if k in data.columns and not data[k].isnull().all()]
     if not avail_keys: return pd.DataFrame(), None
     
@@ -328,7 +314,6 @@ def calculate_live_safe(data):
 def get_synthetic_backtest_data():
     tickers = list(MAPPING.values()) + SAFE_POOL + ['VT']
     try:
-        # [關鍵修正] 回測下載也使用 threads=False 確保成功
         data_raw = yf.download(tickers, period="max", interval="1d", auto_adjust=True, progress=False, threads=False)
         
         if isinstance(data_raw.columns, pd.MultiIndex):
@@ -382,13 +367,14 @@ def calculate_backtest_signals_rolling(data):
         model_res = None
         loop_start = BACKTEST_GARCH_WINDOW
         
-        ret_values = s_ret.values
         dates = s_ret.index
         
         for t in range(loop_start, len(s_ret)):
+            # [時序修正]: 切片必須包含 t 日資料，才能用來預測 t+1 日 (避免 T+2 延遲)
+            train = s_ret.iloc[t - BACKTEST_GARCH_WINDOW + 1 : t + 1]
+            if len(train) < 50: continue
+            
             if (t - loop_start) % REFIT_STEP == 0 or model_res is None:
-                train = s_ret.iloc[t-BACKTEST_GARCH_WINDOW : t]
-                if train.std() < 1e-6: continue
                 try:
                     am = arch_model(train, vol='Garch', p=1, q=1, dist='t', rescale=False)
                     model_res = am.fit(disp='off', show_warning=False)
@@ -540,7 +526,6 @@ with st.expander("🛠️ 數據除錯與狀態 (若數據為 N/A 請點此)"):
     live_data = get_live_data()
     st.write("原始數據形狀:", live_data.shape)
     
-    # 檢查 EDC 是否在 columns
     has_edc = 'EDC' in live_data.columns
     st.write(f"EDC 數據狀態: {'✅ 成功抓取' if has_edc else '❌ 缺失'}")
     
