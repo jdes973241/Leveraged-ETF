@@ -34,36 +34,17 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# [新增] 快取管理與時間診斷工具
-# ==========================================
-with st.sidebar:
-    st.header("🔧 系統診斷")
-    
-    try:
-        tz_tw = pytz.timezone('Asia/Taipei')
-        now_tw = datetime.now(tz_tw)
-        st.info(f"🇹🇼 台灣時間: {now_tw.strftime('%Y-%m-%d %H:%M')}")
-    except Exception as e:
-        st.error(f"時區錯誤: {e}")
-    
-    if st.button("🗑️ 強制清除快取 (重抓數據)"):
-        st.cache_data.clear()
-        st.rerun()
-
-# ==========================================
-# 1. 核心參數
+# 1. 核心參數與時間顯性化
 # ==========================================
 MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"} 
 SAFE_POOL = ["GLD", "TLT"] 
 
-# 風控閾值
 RISK_CONFIG = {
     "UPRO": {"exit_q": 0.99, "entry_q": 0.90},
     "EURL": {"exit_q": 0.99, "entry_q": 0.90},
     "EDC":  {"exit_q": 0.99, "entry_q": 0.90}
 }
 
-# 策略參數
 SMA_MONTHS = 6               
 LIVE_GARCH_WINDOW = 504      
 BACKTEST_GARCH_WINDOW = 504  
@@ -72,27 +53,63 @@ MOM_PERIODS = [3, 6, 9, 12]
 TRANSACTION_COST = 0.001 
 RF_RATE = 0.02 
 
+TZ_TW = pytz.timezone('Asia/Taipei')
+
+# ==========================================
+# [新增] 維運與結算控制台
+# ==========================================
+with st.sidebar:
+    st.header("🔧 系統診斷與維運")
+    now_tw = datetime.now(TZ_TW)
+    st.info(f"🇹🇼 台灣時間: {now_tw.strftime('%Y-%m-%d %H:%M')}")
+    
+    st.divider()
+    st.markdown("### ⚙️ 結算控制器")
+    FORCE_EOM = st.checkbox(
+        "⚠️ 執行月底強制結算", 
+        value=False,
+        help="僅在『每月最後一個交易日』勾選，系統會立即以當下最新收盤價進行月結算，讓您提早取得次月部位訊號。平時請保持關閉以防訊號漂移。"
+    )
+    st.divider()
+    
+    if st.button("🗑️ 強制清除快取 (重抓數據)"):
+        st.cache_data.clear()
+        st.rerun()
+
 def get_daily_leverage_cost(date):
     year = date.year
     if year <= 2007 or year >= 2022: return 0.05 / 252 
     else: return 0.02 / 252
 
-def get_monthly_data(df):
+# ==========================================
+# [優化] 數據結算核心引擎
+# ==========================================
+def get_settled_monthly_data(df, force_eom=False):
     if df.empty: return df
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
         
     period_idx = df.index.to_period('M')
     month_end_dates = df.index.to_series().groupby(period_idx).max()
-    return df.loc[month_end_dates]
+    monthly = df.loc[month_end_dates]
+    
+    last_date = df.index[-1]
+    now_tw = datetime.now(TZ_TW)
+    last_data_period = last_date.to_period('M')
+    current_tw_period = pd.Period(now_tw.strftime('%Y-%m'), freq='M')
+    
+    # 防禦機制：若未強制結算，且最新數據仍在當前自然月中，剔除未完結的月份
+    if not force_eom and (last_data_period == current_tw_period):
+        monthly = monthly.iloc[:-1]
+        
+    return monthly
 
 # ==========================================
-# 2. Live 面板數據與邏輯 (回歸標準版)
+# 2. Live 面板數據與邏輯
 # ==========================================
 @st.cache_data(ttl=300) 
 def get_live_data():
     tickers = list(MAPPING.keys()) + list(MAPPING.values()) + SAFE_POOL
-    
     try:
         data = yf.download(
             tickers, 
@@ -100,56 +117,52 @@ def get_live_data():
             interval="1d", 
             auto_adjust=True, 
             progress=False, 
-            threads=False, 
-            group_by='ticker' 
+            threads=False
         )
-        
-        if data.empty:
-            return pd.DataFrame()
+        if data.empty: return pd.DataFrame()
 
         clean_df = pd.DataFrame(index=data.index)
         
+        # 扁平化結構處理
+        if isinstance(data.columns, pd.MultiIndex):
+            if 'Close' in data.columns.levels[0]:
+                data = data['Close']
+            else:
+                data = data.xs(data.columns.levels[0][0], level=0, axis=1)
+
         for t in tickers:
-            try:
-                if t in data.columns:
-                    ticker_df = data[t]
-                    if 'Close' in ticker_df.columns:
-                        clean_df[t] = ticker_df['Close']
-                    elif 'Price' in ticker_df.columns: 
-                        clean_df[t] = ticker_df['Price']
-                    else:
-                        clean_df[t] = ticker_df.iloc[:, 0]
-            except Exception:
-                pass
+            if t in data.columns: clean_df[t] = data[t]
                 
         if clean_df.index.tz is not None:
             clean_df.index = clean_df.index.tz_localize(None)
 
-        clean_df = clean_df.ffill()
-        return clean_df
-
+        return clean_df.ffill()
     except Exception as e:
         st.error(f"數據下載失敗: {e}")
         return pd.DataFrame()
 
-# 移除快取
-def calculate_live_risk(data):
+# 即時計算，嚴禁快取
+def calculate_live_risk(data, force_eom=False):
     if data.empty: return {}
-    
     avail_cols = [c for c in list(MAPPING.keys()) if c in data.columns]
     if not avail_cols: return {}
     
     sma_tickers = [c for c in list(MAPPING.values()) if c in data.columns]
-    monthly_prices = get_monthly_data(data[sma_tickers])
+    
+    # 透過統一引擎取得已結算的月數據
+    monthly_prices = get_settled_monthly_data(data[sma_tickers], force_eom)
+    if monthly_prices.empty: return {}
+    
     monthly_sma = monthly_prices.rolling(SMA_MONTHS).mean()
     monthly_sig = (monthly_prices > monthly_sma).astype(float)
-    daily_sma_sig = monthly_sig.reindex(data.index).ffill()
+    
+    # [消除滯後]: 取消 .shift(1)，因為回測與實單皆在 T+1 執行 T 日的訊號
+    daily_sma_sig = monthly_sig.reindex(data.index).ffill().fillna(0)
     
     risk_details = {}
     for trade_t, signal_t in MAPPING.items():
         if signal_t not in data.columns: continue
-        if trade_t not in data.columns or data[trade_t].isnull().all():
-            continue
+        if trade_t not in data.columns or data[trade_t].isnull().all(): continue
             
         series = data[trade_t]
         ret = data[signal_t].pct_change() * 100
@@ -161,12 +174,9 @@ def calculate_live_risk(data):
             am = arch_model(window, vol='Garch', p=1, q=1, dist='t', rescale=False)
             res = am.fit(disp='off', show_warning=False)
             
-            # [時序修正]: 提取樣本內預測與一步向前樣本外預測
             in_sample_vol = res.conditional_volatility * np.sqrt(252)
             fc = res.forecast(horizon=1, reindex=False)
             next_vol = np.sqrt(fc.variance.iloc[-1].values[0]) * np.sqrt(252)
-            
-            # 將波動率向左對齊：Vol[t] 等於預測明日 t+1 的波動率
             vol_aligned = np.append(in_sample_vol.values[1:], next_vol)
             
             df = pd.DataFrame({'Price': series, 'Ret': ret})
@@ -174,8 +184,7 @@ def calculate_live_risk(data):
             
             if signal_t in daily_sma_sig.columns:
                 df['SMA_State'] = daily_sma_sig[signal_t]
-            else:
-                df['SMA_State'] = 1.0 
+            else: df['SMA_State'] = 1.0 
             
             cfg = RISK_CONFIG[trade_t]
             df['Exit_Th'] = df['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
@@ -183,7 +192,6 @@ def calculate_live_risk(data):
             
             df['GARCH_State'] = np.nan
             valid = df['Exit_Th'].notna() & df['Vol'].notna()
-            
             mask_exit = valid & (df['Vol'] > df['Exit_Th'])
             mask_entry = valid & (df['Vol'] < df['Entry_Th'])
             
@@ -192,59 +200,33 @@ def calculate_live_risk(data):
             df['GARCH_State'] = df['GARCH_State'].ffill().fillna(1.0)
             
             df['Weight'] = (0.5 * df['GARCH_State']) + (0.5 * df['SMA_State'])
-            df = df.dropna(subset=['Weight'])
-            risk_details[trade_t] = df
+            risk_details[trade_t] = df.dropna(subset=['Weight'])
         except: continue
     return risk_details
 
-# 移除快取
-def calculate_live_selection(data):
+def calculate_live_selection(data, force_eom=False):
     if data.empty: return pd.DataFrame(), None
-    
     avail_keys = [k for k in list(MAPPING.keys()) if k in data.columns and not data[k].isnull().all()]
     if not avail_keys: return pd.DataFrame(), None
     
     prices = data[avail_keys]
-    monthly = get_monthly_data(prices)
-    
+    monthly = get_settled_monthly_data(prices, force_eom)
     if monthly.empty: return pd.DataFrame(), None
 
-    last_date = data.index[-1]
-    
-    try:
-        tz_tw = pytz.timezone('Asia/Taipei')
-        now_tw = datetime.now(tz_tw)
-        
-        last_data_period = last_date.to_period('M')
-        current_tw_period = pd.Period(now_tw.strftime('%Y-%m'), freq='M')
-
-        if last_data_period < current_tw_period:
-            ref_date = monthly.index[-1]
-        else:
-            prev_months = monthly[monthly.index.to_period('M') < last_data_period]
-            if prev_months.empty: return pd.DataFrame(), None
-            ref_date = prev_months.index[-1]
-    except Exception as e:
-        st.error(f"日期計算錯誤: {e}")
-        return pd.DataFrame(), None
-    
+    ref_date = monthly.index[-1]
     metrics = []
-    
     for ticker in prices.columns:
         row = {'Ticker': ticker}
         try:
             if ref_date not in monthly.index: continue
-            
             p_now = monthly.loc[ref_date, ticker]
+            
             for m in MOM_PERIODS:
                 loc = monthly.index.get_loc(ref_date)
-                
                 if loc >= m:
                     p_prev = monthly.iloc[loc-m][ticker]
-                    if pd.isna(p_prev) or p_prev == 0:
-                        row[f'Ret_{m}M'] = np.nan
-                    else:
-                        row[f'Ret_{m}M'] = (p_now - p_prev) / p_prev
+                    if pd.isna(p_prev) or p_prev == 0: row[f'Ret_{m}M'] = np.nan
+                    else: row[f'Ret_{m}M'] = (p_now - p_prev) / p_prev
                 else: row[f'Ret_{m}M'] = np.nan
             
             d_loc = data.index.get_indexer([ref_date], method='pad')[0]
@@ -256,7 +238,6 @@ def calculate_live_selection(data):
         except: continue
         
     if not metrics: return pd.DataFrame(), None
-    
     df = pd.DataFrame(metrics).set_index('Ticker')
     z_sum = pd.Series(0.0, index=df.index)
     for m in MOM_PERIODS:
@@ -269,38 +250,17 @@ def calculate_live_selection(data):
     df['Total_Z'] = z_sum
     return df.sort_values('Total_Z', ascending=False), ref_date
 
-# 移除快取
-def calculate_live_safe(data):
+def calculate_live_safe(data, force_eom=False):
     if data.empty: return "TLT", pd.DataFrame(), None
-    
     avail_safe = [t for t in SAFE_POOL if t in data.columns]
     if not avail_safe: return "TLT", pd.DataFrame(), None
 
-    monthly = get_monthly_data(data[avail_safe])
+    monthly = get_settled_monthly_data(data[avail_safe], force_eom)
     if monthly.empty: return "TLT", pd.DataFrame(), None
 
-    last_date = data.index[-1]
-    
-    try:
-        tz_tw = pytz.timezone('Asia/Taipei')
-        now_tw = datetime.now(tz_tw)
-        
-        last_data_period = last_date.to_period('M')
-        current_tw_period = pd.Period(now_tw.strftime('%Y-%m'), freq='M')
-
-        if last_data_period < current_tw_period:
-            ref_date = monthly.index[-1]
-        else:
-            prev_months = monthly[monthly.index.to_period('M') < last_data_period]
-            if prev_months.empty: return "TLT", pd.DataFrame(), None
-            ref_date = prev_months.index[-1]
-    except:
-        return "TLT", pd.DataFrame(), None
-    
+    ref_date = monthly.index[-1]
     loc = monthly.index.get_loc(ref_date)
-    
-    if loc >= 12:
-        ret_12m = (monthly.iloc[loc] / monthly.iloc[loc-12]) - 1
+    if loc >= 12: ret_12m = (monthly.iloc[loc] / monthly.iloc[loc-12]) - 1
     else: ret_12m = pd.Series(0.0, index=avail_safe)
     
     winner = ret_12m.idxmax()
@@ -315,14 +275,11 @@ def get_synthetic_backtest_data():
     tickers = list(MAPPING.values()) + SAFE_POOL + ['VT']
     try:
         data_raw = yf.download(tickers, period="max", interval="1d", auto_adjust=True, progress=False, threads=False)
-        
         if isinstance(data_raw.columns, pd.MultiIndex):
             if 'Close' in data_raw.columns.levels[0]: data_raw = data_raw['Close']
-            else: pass
+            else: data_raw = data_raw.xs(data_raw.columns.levels[0][0], level=0, axis=1)
         
-        if data_raw.index.tz is not None:
-            data_raw.index = data_raw.index.tz_localize(None)
-
+        if data_raw.index.tz is not None: data_raw.index = data_raw.index.tz_localize(None)
         data_raw = data_raw.ffill()
         
         synthetic_data = pd.DataFrame(index=data_raw.index)
@@ -333,30 +290,29 @@ def get_synthetic_backtest_data():
         REVERSE_MAP = {v: k for k, v in MAPPING.items()} 
         for ticker_1x in MAPPING.values():
             if ticker_1x not in data_raw.columns: continue
-            
             ticker_3x = REVERSE_MAP[ticker_1x]
             ret_1x = data_raw[ticker_1x].pct_change().fillna(0)
             costs = pd.Series([get_daily_leverage_cost(d) for d in ret_1x.index], index=ret_1x.index)
-            ret_3x = (ret_1x * 3.0) - costs
-            synthetic_data[ticker_3x] = (1 + ret_3x).cumprod() * 100
+            synthetic_data[ticker_3x] = (1 + ((ret_1x * 3.0) - costs)).cumprod() * 100
             synthetic_data[f"RAW_{ticker_3x}"] = data_raw[ticker_1x] 
             
         return synthetic_data.dropna()
     except: return pd.DataFrame()
 
-@st.cache_data(ttl=3600, show_spinner="計算滾動回測訊號 (這需要約 1 分鐘)...")
+@st.cache_data(ttl=3600, show_spinner="計算滾動回測訊號...")
 def calculate_backtest_signals_rolling(data):
-    # 1. 月均線 (SMA 6 Months)
     raw_cols = [f"RAW_{k}" for k in MAPPING.keys() if f"RAW_{k}" in data.columns]
     if not raw_cols: return pd.DataFrame(), pd.Series(), pd.Series()
 
-    monthly_prices = get_monthly_data(data[raw_cols])
+    # 回測直接使用完整序列轉換，保留最後一筆作為最新訊號
+    monthly_prices = get_settled_monthly_data(data[raw_cols], force_eom=True) 
     monthly_sma = monthly_prices.rolling(SMA_MONTHS).mean()
     monthly_sma_sig = (monthly_prices > monthly_sma).astype(float)
-    daily_sma_sig = monthly_sma_sig.reindex(data.index).ffill().shift(1)
+    
+    # [消除滯後]: 移除 shift(1)，在 run_backtest_logic 中透過 loc[yesterday] 取用 T 日訊號執行 T+1 交易
+    daily_sma_sig = monthly_sma_sig.reindex(data.index).ffill().fillna(0)
     daily_sma_sig.columns = [c.replace("RAW_", "") for c in raw_cols]
 
-    # 2. 滾動 GARCH
     target_tickers = [k for k in MAPPING.keys() if f"RAW_{k}" in data.columns]
     h_risk_weights = pd.DataFrame(index=data.index, columns=target_tickers)
     
@@ -366,30 +322,24 @@ def calculate_backtest_signals_rolling(data):
         forecasts = {}
         model_res = None
         loop_start = BACKTEST_GARCH_WINDOW
-        
         dates = s_ret.index
         
         for t in range(loop_start, len(s_ret)):
-            # [時序修正]: 切片必須包含 t 日資料，才能用來預測 t+1 日 (避免 T+2 延遲)
             train = s_ret.iloc[t - BACKTEST_GARCH_WINDOW + 1 : t + 1]
             if len(train) < 50: continue
             
             if (t - loop_start) % REFIT_STEP == 0 or model_res is None:
-                try:
-                    am = arch_model(train, vol='Garch', p=1, q=1, dist='t', rescale=False)
-                    model_res = am.fit(disp='off', show_warning=False)
+                try: model_res = arch_model(train, vol='Garch', p=1, q=1, dist='t', rescale=False).fit(disp='off', show_warning=False)
                 except: pass
             
             if model_res:
                 try:
                     fc = model_res.forecast(horizon=1, reindex=False)
-                    vol = np.sqrt(fc.variance.iloc[-1].values[0]) * np.sqrt(252)
-                    forecasts[dates[t]] = vol
+                    forecasts[dates[t]] = np.sqrt(fc.variance.iloc[-1].values[0]) * np.sqrt(252)
                 except: pass
         
         vol_series = pd.Series(forecasts).reindex(data.index)
         cfg = RISK_CONFIG[ticker_3x]
-        
         ex_th = vol_series.rolling(252).quantile(cfg['exit_q']).shift(1)
         en_th = vol_series.rolling(252).quantile(cfg['entry_q']).shift(1)
         
@@ -400,17 +350,12 @@ def calculate_backtest_signals_rolling(data):
         g_sig = g_sig.ffill().fillna(0.0)
         
         if ticker_3x in daily_sma_sig.columns:
-            s_sig = daily_sma_sig[ticker_3x]
-            h_risk_weights[ticker_3x] = 0.5*g_sig + 0.5*s_sig
+            h_risk_weights[ticker_3x] = 0.5*g_sig + 0.5*daily_sma_sig[ticker_3x]
         
-    h_risk_weights = h_risk_weights.dropna()
-    
-    # 3. 選股 (Monthly)
-    monthly_src = get_monthly_data(data[raw_cols])
+    monthly_src = get_settled_monthly_data(data[raw_cols], force_eom=True)
     monthly_src.columns = [c.replace("RAW_", "") for c in raw_cols]
-    
     daily_vol = data[raw_cols].pct_change().rolling(126).std() * np.sqrt(252)
-    monthly_vol = get_monthly_data(daily_vol)
+    monthly_vol = get_settled_monthly_data(daily_vol, force_eom=True)
     monthly_vol.columns = monthly_src.columns
     
     scores = pd.DataFrame(0.0, index=monthly_src.index, columns=monthly_src.columns)
@@ -421,40 +366,33 @@ def calculate_backtest_signals_rolling(data):
         scores += z.fillna(0)
     hist_winners = scores.idxmax(axis=1)
     
-    # 4. 避險輪動
     avail_safe = [t for t in SAFE_POOL if t in data.columns]
-    safe_monthly = get_monthly_data(data[avail_safe])
+    safe_monthly = get_settled_monthly_data(data[avail_safe], force_eom=True)
     hist_safe = safe_monthly.pct_change(12).idxmax(axis=1).fillna('TLT')
     
-    return h_risk_weights, hist_winners, hist_safe
+    return h_risk_weights.dropna(), hist_winners, hist_safe
 
 def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
     dates = data.index
     start_idx = BACKTEST_GARCH_WINDOW + 252
-    
     vt_start = data['VT'].first_valid_index()
-    if vt_start:
-        vt_idx = data.index.get_loc(vt_start)
-        start_idx = max(start_idx, vt_idx)
-    
+    if vt_start: start_idx = max(start_idx, data.index.get_loc(vt_start))
     if start_idx >= len(dates): return None, None, None, None
     
-    strategy_ret = []
-    valid_dates = []
+    strategy_ret, valid_dates = [], []
     hold_counts = defaultdict(float)
     prev_pos = {}
     
     for i in range(start_idx, len(dates)):
         today = dates[i]
-        yesterday = dates[i-1]
+        yesterday = dates[i-1] # T-1 的訊號，在 T 日承受損益
         
         past_wins = winners_series[winners_series.index <= yesterday]
         if past_wins.empty: continue
         target_risky = past_wins.iloc[-1]
         
         past_safe = safe_signals[safe_signals.index <= yesterday]
-        if past_safe.empty: target_safe = 'TLT'
-        else: target_safe = past_safe.iloc[-1]
+        target_safe = past_safe.iloc[-1] if not past_safe.empty else 'TLT'
         
         if target_risky in risk_weights.columns and yesterday in risk_weights.index:
             w_risk = risk_weights.loc[yesterday, target_risky]
@@ -474,23 +412,17 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
             if w_prev != w_curr: cost += abs(w_curr - w_prev) * TRANSACTION_COST
             
         day_ret = 0.0
-        if w_risk > 0:
-            if target_risky in data.columns:
-                r = data[target_risky].pct_change().iloc[i]
-                if np.isnan(r): r=0
-                day_ret += w_risk * r
-        if w_safe > 0:
-            if target_safe in data.columns:
-                r = data[target_safe].pct_change().iloc[i]
-                if np.isnan(r): r=0
-                day_ret += w_safe * r
+        if w_risk > 0 and target_risky in data.columns:
+            r = data[target_risky].pct_change().iloc[i]
+            day_ret += w_risk * (r if not np.isnan(r) else 0)
+        if w_safe > 0 and target_safe in data.columns:
+            r = data[target_safe].pct_change().iloc[i]
+            day_ret += w_safe * (r if not np.isnan(r) else 0)
             
         strategy_ret.append(day_ret - cost)
         valid_dates.append(today)
-        
         hold_counts[target_risky] += w_risk
         hold_counts[target_safe] += w_safe
-        
         prev_pos = curr_pos
         
     eq = pd.Series(strategy_ret, index=valid_dates)
@@ -513,151 +445,44 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
         curr = val.iloc[-1]
         
     vt_eq = (1 + data['VT'].loc[valid_dates].pct_change().fillna(0)).cumprod()
-    
     return cum_eq, b_eq, vt_eq, hold_counts
 
 # ==========================================
 # 4. Dashboard 介面
 # ==========================================
-st.title("🛡️ 雙重動能與動態風控 (Standard Fix)")
-st.caption(f"配置: SMA {SMA_MONTHS}M (Monthly) / GARCH (Q{RISK_CONFIG['UPRO']['exit_q']*100:.0f}) / Safe (GLD/TLT)")
+st.title("🛡️ 雙重動能與動態風控 (Live Ops Fix)")
+st.caption(f"配置: SMA {SMA_MONTHS}M / GARCH (Q{RISK_CONFIG['UPRO']['exit_q']*100:.0f}) / Safe (GLD/TLT)")
 
-with st.expander("🛠️ 數據除錯與狀態 (若數據為 N/A 請點此)"):
+with st.expander("🛠️ 數據除錯與狀態"):
     live_data = get_live_data()
     st.write("原始數據形狀:", live_data.shape)
-    
-    has_edc = 'EDC' in live_data.columns
-    st.write(f"EDC 數據狀態: {'✅ 成功抓取' if has_edc else '❌ 缺失'}")
-    
-    st.write("最後更新日期:", live_data.index[-1] if not live_data.empty else "無")
-    
-    try:
-        tz_tw = pytz.timezone('Asia/Taipei')
-        st.write("系統時間 (Taiwan):", datetime.now(tz_tw))
-    except:
-        st.write("系統時間: 本地時區庫未加載")
-    
-    if live_data.empty:
-        st.error("⚠️ 警告：所有數據下載失敗。")
-    else:
-        st.success("✅ 數據下載流程完成")
+    st.write(f"EDC 數據狀態: {'✅ 成功' if 'EDC' in live_data.columns else '❌ 缺失'}")
+    st.write("最後更新日期:", live_data.index[-1].strftime('%Y-%m-%d') if not live_data.empty else "無")
+    if live_data.empty: st.error("⚠️ 數據下載失敗。")
 
-# --- Live Data Loading ---
-risk_live = calculate_live_risk(live_data)
-sel_df, sel_date = calculate_live_selection(live_data)
-safe_win, safe_df, safe_date = calculate_live_safe(live_data)
+# --- Live Data Loading (導入 FORCE_EOM 控制) ---
+risk_live = calculate_live_risk(live_data, force_eom=FORCE_EOM)
+sel_df, sel_date = calculate_live_selection(live_data, force_eom=FORCE_EOM)
+safe_win, safe_df, safe_date = calculate_live_safe(live_data, force_eom=FORCE_EOM)
 
 winner = sel_df.index[0] if not sel_df.empty else "N/A"
-if winner in risk_live:
+if winner in risk_live and not risk_live[winner].empty:
     latest_r = risk_live[winner].iloc[-1]
     final_w = latest_r['Weight']
     g_state = latest_r['GARCH_State']
 else:
-    final_w = 0.0
-    g_state = 0.0
+    final_w, g_state = 0.0, 0.0
 
 if sel_date:
-    st.info(f"🔒 **訊號鎖定日**: {sel_date.strftime('%Y-%m-%d')} (根據 {sel_date.strftime('%Y-%m')} 月底收盤)")
-
-with st.expander("📖 策略詳細規則", expanded=False):
-    st.markdown(r"""
-    這份程式碼建構了一個 **「雙重動能與動態雙層風控（Dual Momentum with Dynamic Dual-Layer Risk Control）」** 的策略儀表板，並包含即時監控（Live）與嚴格的滾動回測（Strict Rolling Backtest）兩大模組。
-    
-    以下是依據程式碼邏輯拆解的完整策略規格與數據細節：
-    
-    ### 1. 投資全集與資產映射 (Asset Universe)
-    策略採用 **槓桿 ETF** 作為進攻資產，並透過 **原型 ETF (1x)** 的數據來生成訊號與合成回測歷史，以解決槓桿 ETF 歷史數據過短的問題。
-    
-    | 角色 | 交易代號 (3x) | 訊號源代號 (1x) | 對應資產類別 |
-    | :--- | :--- | :--- | :--- |
-    | **進攻 (Risky)** | **UPRO** | SPY | 美股大型股 (S&P 500) |
-    | **進攻 (Risky)** | **EURL** | VGK | 歐洲已開發市場 |
-    | **進攻 (Risky)** | **EDC** | EEM | 新興市場 |
-    | **避險 (Safe)** | **GLD** / **TLT** | (自身) | 黃金 / 20年期美債 |
-    
-    ### 2. 進攻資產選擇機制 (Selection Logic)
-    策略每月進行一次選股，挑選當下動能最強的 **1 檔** 進攻資產。
-    * **頻率**：月頻（Monthly），於每個月最後一個交易日計算。
-    * **動能指標**：綜合風險調整動能 Z-Score (Composite Risk-Adjusted Momentum Z-Score)。
-    * **計算步驟**：
-        1. **多週期回報**：計算 3、6、9、12 個月的累積報酬率。
-        2. **波動率調整**：將上述報酬率除以過去 126 天（約半年）的年化波動率，得到 Sharpe-like ratio。
-        3. **標準化 (Z-Score)**：將三個標的在同一週期內的數值進行標準化（Z-Score）。
-        4. **加總評分**：將四個週期 (3/6/9/12M) 的 Z-Score 相加，總分最高者勝出。
-    
-    ### 3. 雙層動態風控機制 (Risk Control Logic)
-    選定標的後，透過兩層風控決定曝險比例（Weight）。每層風控貢獻 50% 權重，因此持倉水位可能為 **0% (全避險)、50% (半倉)、100% (全攻)**。
-    
-    **第一層：趨勢濾網 (Trend Filter) - 權重 50%**
-    * **指標**：6 個月簡單移動平均線 (SMA 6 Months)。
-    * **邏輯**：
-        * 若 **月收盤價 > 6個月均線** $\rightarrow$ **SMA_State = 1 (安全)**。
-        * 若 **月收盤價 < 6個月均線** $\rightarrow$ **SMA_State = 0 (危險)**。
-    * **數據源**：使用原型 ETF (如 SPY) 判斷。
-    
-    **第二層：波動率濾網 (Volatility Filter) - 權重 50%**
-    * **模型**：GARCH(1,1) with Student's t-distribution。
-    * **訓練窗口**：
-        * **Live**：最近 504 天。
-        * **Backtest**：嚴格滾動視窗（Rolling Window），只看過去 504 天，絕不使用未來數據。
-    * **重訓頻率 (Refit)**：每 5 天重新擬合一次 GARCH 參數。
-    * **訊號邏輯 (Regime Switching)**：
-        1. 預測 T 日的條件波動率 (Conditional Volatility)。
-        2. 計算該波動率在過去 252 天歷史中的 **百分位數 (Quantile/Percentile)**。
-        3. **出場 (Exit)**：若波動率 > 歷史 **99%** 分位數 $\rightarrow$ **GARCH_State = 0 (危險)**。
-        4. **進場 (Entry)**：若波動率 < 歷史 **90%** 分位數 $\rightarrow$ **GARCH_State = 1 (安全)**。
-        5. **滯後性**：具備 Hysteresis 特性，未觸發閾值前維持原狀態。
-    
-    ### 4. 避險資產輪動 (Safe Asset Rotation)
-    當進攻資產權重未滿 100% 時，剩餘資金配置於避險資產。
-    * **候選池**：GLD (黃金), TLT (美債)。
-    * **選擇邏輯**：比較兩者 **過去 12 個月** 的累積報酬率，強者勝出。
-    * **預設值**：若數據不足，預設持有 TLT。
-    
-    ### 5. 嚴格回測細節 (Strict Backtest Specifics)
-    這部分程式碼非常強調「真實性」與「防偏誤」，具體實作如下：
-    
-    **合成數據 (Synthetic Data)**：
-    * 不直接使用 3x ETF 歷史數據（因時間太短）。
-    * **合成公式**：$Ret_{3x} = (Ret_{1x} \times 3.0) - Cost_{borrow}$。
-    * **融資成本 ($Cost_{borrow}$)**：動態設定。
-        * 2008-2021 (低利時期)：年化 2%。
-        * 2022-至今 (升息時期) 或 2007以前：年化 5%。
-    
-    **無前視偏差 (Look-Ahead Bias Free)**：
-    * GARCH 模型訓練嚴格限制在 **t-504** 到 **t-1** 的視窗內。
-    * SMA 與動能訊號均使用 T-1 日或上個月底的數據。
-    
-    **交易執行細節**：
-    * **T+1 執行**：T 日計算出的訊號，於 T+1 日開盤/收盤價執行（程式碼邏輯為日報酬結算，隱含 T+1 概念）。
-    * **交易成本**：單邊 **0.1% (10 bps)**。
-    * **無風險利率 (Risk-Free Rate)**：計算 Sharpe Ratio 時使用年化 2%。
-    
-    ### 6. 輸出指標 (Dashboard Metrics)
-    儀表板最終計算並展示以下關鍵績效指標：
-    * **CAGR**：年化複合成長率。
-    * **Sharpe Ratio**：夏普比率 (超額報酬 / 標準差)。
-    * **Sortino Ratio**：索提諾比率 (只考慮下行波動)。
-    * **Max Drawdown**：最大回撤。
-    * **Avg Roll 5Y**：滾動 5 年平均年化報酬率（評估長期持有穩定性）。
-    * **Time in 3x**：持有 3x 槓桿資產的時間比例。
-    
-    **總結：策略核心公式**
-    
-    $$Weight_{Risky} = 0.5 \times I(Price > SMA_{6m}) + 0.5 \times I(Vol_{GARCH} < Threshold)$$
-    
-    $$Position = Weight_{Risky} \times \text{Best\_Momentum\_3x} + (1 - Weight_{Risky}) \times \text{Best\_Safe\_Asset}$$
-    
-    這是一個結合了 **「相對動能 (選股)」** 與 **「雙重絕對動能 (擇時)」** 的複合策略。
-    """)
+    status_icon = "🔓 強制提早結算啟用中" if FORCE_EOM else "🔒 正規結算鎖定"
+    st.info(f"{status_icon} | **訊號基準日**: {sel_date.strftime('%Y-%m-%d')}")
 
 c1, c2, c3, c4 = st.columns(4)
 with c1: st.metric("🏆 本月進攻贏家", winner)
 with c2: 
     color = "green" if final_w==1 else "orange" if final_w==0.5 else "red"
     st.markdown(f"### 🎯 權重: :{color}[{final_w*100:.0f}%]")
-with c3: 
-    st.metric("GARCH 風控", "安全" if g_state==1 else "危險", delta="✅" if g_state==1 else "🔻")
+with c3: st.metric("GARCH 風控", "安全" if g_state==1 else "危險", delta="✅" if g_state==1 else "🔻")
 with c4: 
     s_val = safe_df.loc[safe_win, '12M Return'] if not safe_df.empty else 0
     st.metric("🛡️ 避險資產", safe_win, f"12M: {s_val:.1%}")
@@ -667,14 +492,14 @@ st.divider()
 t1, t2, t3, t4, t5, t6 = st.tabs(["數據", "風控細節", "權重狀態", "選股排名", "避險輪動", "部位總結"])
 with t1: st.dataframe(live_data.tail(5).style.format("{:.2f}"), use_container_width=True)
 with t2:
-    if winner in risk_live:
-        st.dataframe(risk_live[winner].tail(10)[['Price','Vol','Exit_Th','Entry_Th','GARCH_State']].style.format("{:.2f}"), use_container_width=True)
+    if winner in risk_live and not risk_live[winner].empty:
+        st.dataframe(risk_live[winner].tail(10)[['Price','Vol','Exit_Th','Entry_Th','GARCH_State']].style.format("{:.2f}"))
 with t3:
-    if winner in risk_live:
-        st.dataframe(risk_live[winner].tail(10)[['GARCH_State','SMA_State','Weight']], use_container_width=True)
+    if winner in risk_live and not risk_live[winner].empty:
+        st.dataframe(risk_live[winner].tail(10)[['GARCH_State','SMA_State','Weight']])
 with t4: st.dataframe(sel_df.style.format("{:.2f}"), use_container_width=True)
 with t5: st.dataframe(safe_df.style.format("{:.2%}"), use_container_width=True)
-with t6: st.success(f"建議持有: **{final_w*100:.0f}% {winner}** + **{(1-final_w)*100:.0f}% {safe_win}**")
+with t6: st.success(f"建議次日開盤持有: **{final_w*100:.0f}% {winner}** + **{(1-final_w)*100:.0f}% {safe_win}**")
 
 st.divider()
 
@@ -682,20 +507,16 @@ st.divider()
 # 5. 回測區塊 (Strict Rolling)
 # ==========================================
 st.header("⏳ 嚴格滾動回測 (Synthetic 3x)")
-st.caption("回測數據使用 1x 原型 ETF 合成，並自動對齊 VT 上市日以確保基準一致。")
-
 syn_data = get_synthetic_backtest_data()
 
 if not syn_data.empty:
     if st.button("🚀 開始滾動回測 (約需 30-60 秒)"):
         with st.spinner("正在進行 GARCH 滾動訓練與參數擬合..."):
             h_risk, h_win, h_safe = calculate_backtest_signals_rolling(syn_data)
-            
         with st.spinner("正在執行交易回測..."):
             s_eq, b_eq, v_eq, holds = run_backtest_logic(syn_data, h_risk, h_win, h_safe)
         
         if s_eq is not None:
-            # Stats
             def calc_stats(eq, dr):
                 d = (eq.index[-1] - eq.index[0]).days
                 cagr = (eq.iloc[-1]) ** (365.25/d) - 1
@@ -704,8 +525,7 @@ if not syn_data.empty:
                 sharpe = (excess.mean()/excess.std())*np.sqrt(252)
                 down = excess.copy(); down[down>0]=0
                 down_std = np.sqrt((down**2).mean())*np.sqrt(252)
-                sortino = (excess.mean()*252)/(down_std+1e-6)
-                return cagr, sortino, sharpe, mdd
+                return cagr, (excess.mean()*252)/(down_std+1e-6), sharpe, mdd
             
             s_s = calc_stats(s_eq, s_eq.pct_change().fillna(0))
             b_s = calc_stats(b_eq, b_eq.pct_change().fillna(0))
@@ -717,12 +537,10 @@ if not syn_data.empty:
 
             st.write("### 📈 績效指標")
             m1, m2, m3, m4, m5, m6 = st.columns(6)
-            
             def m_box(label, v, b, vt, fmt="{:.2%}"):
                 st.markdown(f"""
                 <div class="metric-card">
-                    <p class="metric-label">{label}</p>
-                    <p class="metric-value">{fmt.format(v)}</p>
+                    <p class="metric-label">{label}</p><p class="metric-value">{fmt.format(v)}</p>
                     <p class="metric-sub">3x: {fmt.format(b)} | VT: {fmt.format(vt)}</p>
                 </div>""", unsafe_allow_html=True)
                 
@@ -732,42 +550,13 @@ if not syn_data.empty:
             with m4: m_box("Avg 5Y", r5_s, r5_b, r5_v)
             with m5: m_box("MaxDD", s_s[3], b_s[3], v_s[3])
             
-            risky_hold_sum = sum([v for k,v in holds.items() if k in MAPPING.keys()])
-            t_3x = risky_hold_sum / len(s_eq)
+            t_3x = sum([v for k,v in holds.items() if k in MAPPING.keys()]) / len(s_eq)
             with m6: m_box("Time in 3x", t_3x, 1.0, 1.0)
             
             st.divider()
-            
-            # --- Charting (Fixing Altair Display) ---
             st.write("### 📊 權益曲線")
             df_chart = pd.DataFrame({'Date': s_eq.index, 'Strategy': s_eq, 'Bench (3x)': b_eq, 'VT': v_eq}).melt('Date', var_name='Asset', value_name='NAV')
-            c1 = alt.Chart(df_chart).mark_line().encode(
+            st.altair_chart(alt.Chart(df_chart).mark_line().encode(
                 x='Date', y=alt.Y('NAV', scale=alt.Scale(type='log')), 
                 color='Asset', tooltip=['Date','Asset', alt.Tooltip('NAV', format='.2f')]
-            ).properties(width=800, height=350)
-            st.altair_chart(c1, use_container_width=True)
-
-            c_col1, c_col2 = st.columns(2)
-            with c_col1:
-                st.write("### 📉 回撤幅度")
-                dd_s = s_eq/s_eq.cummax()-1
-                dd_b = b_eq/b_eq.cummax()-1
-                dd_v = v_eq/v_eq.cummax()-1
-                df_dd = pd.DataFrame({'Date': s_eq.index, 'Strategy': dd_s, 'Bench (3x)': dd_b, 'VT': dd_v}).melt('Date', var_name='Asset', value_name='DD')
-                c2 = alt.Chart(df_dd).mark_line().encode(
-                    x='Date', y=alt.Y('DD', axis=alt.Axis(format='%')), 
-                    color='Asset', tooltip=['Date','Asset', alt.Tooltip('DD', format='.2%')]
-                ).properties(width=400, height=250)
-                st.altair_chart(c2, use_container_width=True)
-            
-            with c_col2:
-                st.write("### 🔄 滾動 5 年年化")
-                roll_s = s_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1)
-                roll_b = b_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1)
-                roll_v = v_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1)
-                df_r5 = pd.DataFrame({'Date': s_eq.index, 'Strategy': roll_s, 'Bench (3x)': roll_b, 'VT': roll_v}).melt('Date', var_name='Asset', value_name='Roll5Y')
-                c3 = alt.Chart(df_r5.dropna()).mark_line().encode(
-                    x='Date', y=alt.Y('Roll5Y', axis=alt.Axis(format='%')), 
-                    color='Asset', tooltip=['Date','Asset', alt.Tooltip('Roll5Y', format='.2%')]
-                ).properties(width=400, height=250)
-                st.altair_chart(c3, use_container_width=True)
+            ).properties(width=800, height=350), use_container_width=True)
