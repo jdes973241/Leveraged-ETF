@@ -45,11 +45,9 @@ with st.sidebar:
         st.info(f"🇹🇼 台灣時間: {now_tw.strftime('%Y-%m-%d %H:%M')}")
     except Exception as e:
         st.error(f"時區錯誤: {e}")
-        
-    st.divider()
-    # [修改點 1] 加入強制結算勾選框
+    
+    # [修改點] 增加強制結算按鈕
     FORCE_EOM = st.checkbox("⚠️ 執行月底強制結算", value=False, help="僅在『月底當天』勾選，強制系統立刻以最新收盤價進行月結算。")
-    st.divider()
     
     if st.button("🗑️ 強制清除快取 (重抓數據)"):
         st.cache_data.clear()
@@ -223,7 +221,7 @@ def calculate_live_selection(data):
         last_data_period = last_date.to_period('M')
         current_tw_period = pd.Period(now_tw.strftime('%Y-%m'), freq='M')
 
-        # [修改點 2] 判斷是否開啟 FORCE_EOM
+        # [修改點] 加上 FORCE_EOM 判斷
         if FORCE_EOM or (last_data_period < current_tw_period):
             ref_date = monthly.index[-1]
         else:
@@ -294,7 +292,7 @@ def calculate_live_safe(data):
         last_data_period = last_date.to_period('M')
         current_tw_period = pd.Period(now_tw.strftime('%Y-%m'), freq='M')
 
-        # [修改點 3] 判斷是否開啟 FORCE_EOM
+        # [修改點] 加上 FORCE_EOM 判斷
         if FORCE_EOM or (last_data_period < current_tw_period):
             ref_date = monthly.index[-1]
         else:
@@ -565,6 +563,98 @@ else:
 
 if sel_date:
     st.info(f"🔒 **訊號鎖定日**: {sel_date.strftime('%Y-%m-%d')} (根據 {sel_date.strftime('%Y-%m')} 月底收盤)")
+
+with st.expander("📖 策略詳細規則", expanded=False):
+    st.markdown(r"""
+    這份程式碼建構了一個 **「雙重動能與動態雙層風控（Dual Momentum with Dynamic Dual-Layer Risk Control）」** 的策略儀表板，並包含即時監控（Live）與嚴格的滾動回測（Strict Rolling Backtest）兩大模組。
+    
+    以下是依據程式碼邏輯拆解的完整策略規格與數據細節：
+    
+    ### 1. 投資全集與資Asset Universe)
+    策略採用 **槓桿 ETF** 作為進攻資產，並透過 **原型 ETF (1x)** 的數據來生成訊號與合成回測歷史，以解決槓桿 ETF 歷史數據過短的問題。
+    
+    | 角色 | 交易代號 (3x) | 訊號源代號 (1x) | 對應資產類別 |
+    | :--- | :--- | :--- | :--- |
+    | **進攻 (Risky)** | **UPRO** | SPY | 美股大型股 (S&P 500) |
+    | **進攻 (Risky)** | **EURL** | VGK | 歐洲已開發市場 |
+    | **進攻 (Risky)** | **EDC** | EEM | 新興市場 |
+    | **避險 (Safe)** | **GLD** / **TLT** | (自身) | 黃金 / 20年期美債 |
+    
+    ### 2. 進攻資產選擇機制 (Selection Logic)
+    策略每月進行一次選股，挑選當下動能最強的 **1 檔** 進攻資產。
+    * **頻率**：月頻（Monthly），於每個月最後一個交易日計算。
+    * **動能指標**：綜合風險調整動能 Z-Score (Composite Risk-Adjusted Momentum Z-Score)。
+    * **計算步驟**：
+        1. **多週期回報**：計算 3、6、9、12 個月的累積報酬率。
+        2. **波動率調整**：將上述報酬率除以過去 126 天（約半年）的年化波動率，得到 Sharpe-like ratio。
+        3. **標準化 (Z-Score)**：將三個標的在同一週期內的數值進行標準化（Z-Score）。
+        4. **加總評分**：將四個週期 (3/6/9/12M) 的 Z-Score 相加，總分最高者勝出。
+    
+    ### 3. 雙層動態風控機制 (Risk Control Logic)
+    選定標的後，透過兩層風控決定曝險比例（Weight）。每層風控貢獻 50% 權重，因此持倉水位可能為 **0% (全避險)、50% (半倉)、100% (全攻)**。
+    
+    **第一層：趨勢濾網 (Trend Filter) - 權重 50%**
+    * **指標**：6 個月簡單移動平均線 (SMA 6 Months)。
+    * **邏輯**：
+        * 若 **月收盤價 > 6個月均線** $\rightarrow$ **SMA_State = 1 (安全)**。
+        * 若 **月收盤價 < 6個月均線** $\rightarrow$ **SMA_State = 0 (危險)**。
+    * **數據源**：使用原型 ETF (如 SPY) 判斷。
+    
+    **第二層：波動率濾網 (Volatility Filter) - 權重 50%**
+    * **模型**：GARCH(1,1) with Student's t-distribution。
+    * **訓練窗口**：
+        * **Live**：最近 504 天。
+        * **Backtest**：嚴格滾動視窗（Rolling Window），只看過去 504 天，絕不使用未來數據。
+    * **重訓頻率 (Refit)**：每 5 天重新擬合一次 GARCH 參數。
+    * **訊號邏輯 (Regime Switching)**：
+        1. 預測 T 日的條件波動率 (Conditional Volatility)。
+        2. 計算該波動率在過去 252 天歷史中的 **百分位數 (Quantile/Percentile)**。
+        3. **出場 (Exit)**：若波動率 > 歷史 **99%** 分位數 $\rightarrow$ **GARCH_State = 0 (危險)**。
+        4. **進場 (Entry)**：若波動率 < 歷史 **90%** 分位數 $\rightarrow$ **GARCH_State = 1 (安全)**。
+        5. **滯後性**：具備 Hysteresis 特性，未觸發閾值前維持原狀態。
+    
+    ### 4. 避險資產輪動 (Safe Asset Rotation)
+    當進攻資產權重未滿 100% 時，剩餘資金配置於避險資產。
+    * **候選池**：GLD (黃金), TLT (美債)。
+    * **選擇邏輯**：比較兩者 **過去 12 個月** 的累積報酬率，強者勝出。
+    * **預設值**：若數據不足，預設持有 TLT。
+    
+    ### 5. 嚴格回測細節 (Strict Backtest Specifics)
+    這部分程式碼非常強調「真實性」與「防偏誤」，具體實作如下：
+    
+    **合成數據 (Synthetic Data)**：
+    * 不直接使用 3x ETF 歷史數據（因時間太短）。
+    * **合成公式**：$Ret_{3x} = (Ret_{1x} \times 3.0) - Cost_{borrow}$。
+    * **融資成本 ($Cost_{borrow}$)**：動態設定。
+        * 2008-2021 (低利時期)：年化 2%。
+        * 2022-至今 (升息時期) 或 2007以前：年化 5%。
+    
+    **無前視偏差 (Look-Ahead Bias Free)**：
+    * GARCH 模型訓練嚴格限制在 **t-504** 到 **t-1** 的視窗內。
+    * SMA 與動能訊號均使用 T-1 日或上個月底的數據。
+    
+    **交易執行細節**：
+    * **T+1 執行**：T 日計算出的訊號，於 T+1 日開盤/收盤價執行（程式碼邏輯為日報酬結算，隱含 T+1 概念）。
+    * **交易成本**：單邊 **0.1% (10 bps)**。
+    * **無風險利率 (Risk-Free Rate)**：計算 Sharpe Ratio 時使用年化 2%。
+    
+    ### 6. 輸出指標 (Dashboard Metrics)
+    儀表板最終計算並展示以下關鍵績效指標：
+    * **CAGR**：年化複合成長率。
+    * **Sharpe Ratio**：夏普比率 (超額報酬 / 標準差)。
+    * **Sortino Ratio**：索提諾比率 (只考慮下行波動)。
+    * **Max Drawdown**：最大回撤。
+    * **Avg Roll 5Y**：滾動 5 年平均年化報酬率（評估長期持有穩定性）。
+    * **Time in 3x**：持有 3x 槓桿資產的時間比例。
+    
+    **總結：策略核心公式**
+    
+    $$Weight_{Risky} = 0.5 \times I(Price > SMA_{6m}) + 0.5 \times I(Vol_{GARCH} < Threshold)$$
+    
+    $$Position = Weight_{Risky} \times \text{Best\_Momentum\_3x} + (1 - Weight_{Risky}) \times \text{Best\_Safe\_Asset}$$
+    
+    這是一個結合了 **「相對動能 (選股)」** 與 **「雙重絕對動能 (擇時)」** 的複合策略。
+    """)
 
 c1, c2, c3, c4 = st.columns(4)
 with c1: st.metric("🏆 本月進攻贏家", winner)
