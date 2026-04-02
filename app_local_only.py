@@ -12,7 +12,7 @@ import pytz
 # ==========================================
 # 0. 頁面設定
 # ==========================================
-st.set_page_config(page_title="Dynamic Momentum Strategy (Standard)", layout="wide")
+st.set_page_config(page_title="Dynamic Momentum Strategy (Institutional)", layout="wide")
 warnings.simplefilter(action='ignore')
 alt.data_transformers.disable_max_rows()
 
@@ -58,23 +58,20 @@ with st.sidebar:
 MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"} 
 SAFE_POOL = ["GLD", "TLT"] 
 
-# 風控閾值
 RISK_CONFIG = {
     "UPRO": {"exit_q": 0.99, "entry_q": 0.90},
     "EURL": {"exit_q": 0.99, "entry_q": 0.90},
     "EDC":  {"exit_q": 0.99, "entry_q": 0.90}
 }
 
-# 策略參數
 SMA_MONTHS = 6               
 LIVE_GARCH_WINDOW = 504      
 BACKTEST_GARCH_WINDOW = 504  
 REFIT_STEP = 5               
-MOM_PERIODS = [12]           # [修改點] 鎖定為單一 12 個月絕對動能
+MOM_PERIODS = [12]           
 TRANSACTION_COST = 0.001 
 RF_RATE = 0.02 
 
-# [修改點] 導入真實 3 倍槓桿 ETF 融資成本 (管理費 + 2倍 TRS 利差)
 def get_daily_leverage_cost(date):
     year = date.year
     if year <= 2007: base_rate = 0.050
@@ -152,42 +149,53 @@ def calculate_live_risk(data):
             
         series = data[trade_t]
         ret = data[signal_t].pct_change() * 100
-        window = ret.dropna().tail(LIVE_GARCH_WINDOW * 2) 
-        if len(window) < 100: continue
+        window = ret.dropna().tail(LIVE_GARCH_WINDOW + 252 + 50) 
+        if len(window) < LIVE_GARCH_WINDOW + 50: continue
         
-        try:
-            am = arch_model(window, vol='Garch', p=1, q=1, dist='t', rescale=False)
-            res = am.fit(disp='off', show_warning=False)
-            
-            in_sample_vol = res.conditional_volatility * np.sqrt(252)
-            fc = res.forecast(horizon=1, reindex=False)
-            next_vol = np.sqrt(fc.variance.iloc[-1].values[0]) * np.sqrt(252)
-            
-            vol_aligned = np.append(in_sample_vol.values[1:], next_vol)
-            df = pd.DataFrame({'Price': series, 'Ret': ret})
-            df['Vol'] = pd.Series(vol_aligned, index=window.index).reindex(df.index)
-            
-            if signal_t in daily_sma_sig.columns: df['SMA_State'] = daily_sma_sig[signal_t]
-            else: df['SMA_State'] = 1.0 
-            
-            cfg = RISK_CONFIG[trade_t]
-            df['Exit_Th'] = df['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
-            df['Entry_Th'] = df['Vol'].rolling(252).quantile(cfg['entry_q']).shift(1)
-            
-            df['GARCH_State'] = np.nan
-            valid = df['Exit_Th'].notna() & df['Vol'].notna()
-            
-            mask_exit = valid & (df['Vol'] > df['Exit_Th'])
-            mask_entry = valid & (df['Vol'] < df['Entry_Th'])
-            
-            df.loc[mask_exit, 'GARCH_State'] = 0.0 
-            df.loc[mask_entry, 'GARCH_State'] = 1.0 
-            df['GARCH_State'] = df['GARCH_State'].ffill().fillna(1.0)
-            
-            df['Weight'] = (0.5 * df['GARCH_State']) + (0.5 * df['SMA_State'])
-            df = df.dropna(subset=['Weight'])
-            risk_details[trade_t] = df
-        except: continue
+        forecasts = {}
+        model_res = None
+        dates = window.index
+        loop_start = LIVE_GARCH_WINDOW
+        
+        for t in range(loop_start, len(window)):
+            train = window.iloc[t - LIVE_GARCH_WINDOW + 1 : t + 1]
+            if len(train) < 50: continue
+            if (t - loop_start) % REFIT_STEP == 0 or model_res is None:
+                try:
+                    am = arch_model(train, vol='Garch', p=1, q=1, dist='t', rescale=False)
+                    model_res = am.fit(disp='off', show_warning=False)
+                except: pass
+            if model_res:
+                try:
+                    fc = model_res.forecast(horizon=1, reindex=False)
+                    vol = np.sqrt(fc.variance.iloc[-1].values[0]) * np.sqrt(252)
+                    forecasts[dates[t]] = vol
+                except: pass
+                
+        df = pd.DataFrame({'Price': series, 'Ret': ret})
+        df['Vol'] = pd.Series(forecasts).reindex(df.index)
+        
+        if signal_t in daily_sma_sig.columns: df['SMA_State'] = daily_sma_sig[signal_t]
+        else: df['SMA_State'] = 1.0 
+        
+        cfg = RISK_CONFIG[trade_t]
+        df['Exit_Th'] = df['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
+        df['Entry_Th'] = df['Vol'].rolling(252).quantile(cfg['entry_q']).shift(1)
+        
+        df['GARCH_State'] = np.nan
+        valid = df['Exit_Th'].notna() & df['Vol'].notna()
+        
+        mask_exit = valid & (df['Vol'] > df['Exit_Th'])
+        mask_entry = valid & (df['Vol'] < df['Entry_Th'])
+        
+        df.loc[mask_exit, 'GARCH_State'] = 0.0 
+        df.loc[mask_entry, 'GARCH_State'] = 1.0 
+        df['GARCH_State'] = df['GARCH_State'].ffill().fillna(1.0)
+        
+        df['Weight'] = (0.5 * df['GARCH_State']) + (0.5 * df['SMA_State'])
+        df = df.dropna(subset=['Weight'])
+        risk_details[trade_t] = df
+
     return risk_details
 
 def calculate_live_selection(data):
@@ -223,7 +231,6 @@ def calculate_live_selection(data):
             if ref_date not in monthly.index: continue
             p_now = monthly.loc[ref_date, ticker]
             
-            # 鎖定 12M 單一動能計算
             m = MOM_PERIODS[0]
             loc = monthly.index.get_loc(ref_date)
             if loc >= m:
@@ -232,7 +239,6 @@ def calculate_live_selection(data):
                 else: row[f'Ret_{m}M'] = (p_now - p_prev) / p_prev
             else: row[f'Ret_{m}M'] = np.nan
             
-            # [修改點] 使用 252 天 (12個月) 波動率進行對稱調整
             d_loc = data.index.get_indexer([ref_date], method='pad')[0]
             if d_loc >= 252:
                 subset = prices[ticker].iloc[d_loc-252 : d_loc]
@@ -291,11 +297,10 @@ def calculate_live_safe(data):
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner="準備回測數據 (合成三倍槓桿與隔夜成本)...")
 def get_synthetic_backtest_data():
-    tickers = list(MAPPING.values()) + SAFE_POOL + ['VT']
+    tickers = list(MAPPING.values()) + SAFE_POOL + ['IOO']
     try:
         data_raw = yf.download(tickers, period="max", interval="1d", auto_adjust=True, progress=False, threads=False)
         
-        # [修改點] 獲取 Open 與 Close，為 T+1 開盤市價單準備
         if isinstance(data_raw.columns, pd.MultiIndex):
             new_cols = []
             for col in data_raw.columns:
@@ -306,7 +311,7 @@ def get_synthetic_backtest_data():
             data_raw.index = data_raw.index.tz_localize(None)
 
         req_cols = []
-        for t in list(MAPPING.values()) + SAFE_POOL + ['VT']:
+        for t in list(MAPPING.values()) + SAFE_POOL + ['IOO']:
             if f"{t}_Close" in data_raw.columns and f"{t}_Open" in data_raw.columns:
                 req_cols.extend([f"{t}_Close", f"{t}_Open"])
             elif f"{t}_Close" in data_raw.columns:
@@ -315,7 +320,7 @@ def get_synthetic_backtest_data():
         data_core = data_raw[req_cols].dropna()
         synthetic_data = pd.DataFrame(index=data_core.index)
         
-        if 'VT_Close' in data_core.columns: synthetic_data['VT'] = data_core['VT_Close']
+        if 'IOO_Close' in data_core.columns: synthetic_data['IOO'] = data_core['IOO_Close']
 
         for t_1x in list(MAPPING.values()) + SAFE_POOL:
             if f"{t_1x}_Close" not in data_core.columns: continue
@@ -336,10 +341,8 @@ def get_synthetic_backtest_data():
             synthetic_data[f"{ticker_3x}_Ret_ON"] = (3.0 * synthetic_data[f"{ticker_1x}_Ret_ON"]) - costs
             synthetic_data[f"{ticker_3x}_Ret_ID"] = 3.0 * synthetic_data[f"{ticker_1x}_Ret_ID"]
             
-            # 合成 3x 累計淨值供基準對照
             ret_3x_total = ((1 + synthetic_data[f"{ticker_3x}_Ret_ON"].fillna(0)) * (1 + synthetic_data[f"{ticker_3x}_Ret_ID"].fillna(0))) - 1
             synthetic_data[ticker_3x] = (1 + ret_3x_total).cumprod() * 100
-            
             synthetic_data[f"RAW_{ticker_3x}"] = data_core[f"{ticker_1x}_Close"] 
             
         return synthetic_data.dropna()
@@ -353,7 +356,7 @@ def calculate_backtest_signals_rolling(data):
     monthly_prices = get_monthly_data(data[raw_cols])
     monthly_sma = monthly_prices.rolling(SMA_MONTHS).mean()
     monthly_sma_sig = (monthly_prices > monthly_sma).astype(float)
-    daily_sma_sig = monthly_sma_sig.reindex(data.index).ffill().shift(1)
+    daily_sma_sig = monthly_sma_sig.reindex(data.index).ffill()
     daily_sma_sig.columns = [c.replace("RAW_", "") for c in raw_cols]
 
     target_tickers = [k for k in MAPPING.keys() if f"RAW_{k}" in data.columns]
@@ -399,11 +402,9 @@ def calculate_backtest_signals_rolling(data):
         
     h_risk_weights = h_risk_weights.dropna()
     
-    # 3. 選股 (對稱 252 天夏普動能)
     monthly_src = get_monthly_data(data[raw_cols])
     monthly_src.columns = [c.replace("RAW_", "") for c in raw_cols]
     
-    # [修改點] 波動率對齊為 252 天
     daily_vol = data[raw_cols].pct_change().rolling(252).std() * np.sqrt(252)
     monthly_vol = get_monthly_data(daily_vol)
     monthly_vol.columns = monthly_src.columns
@@ -424,7 +425,7 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
     dates = data.index
     start_idx = BACKTEST_GARCH_WINDOW + 252
     
-    vt_start = data['VT'].first_valid_index() if 'VT' in data.columns else None
+    vt_start = data['IOO'].first_valid_index() if 'IOO' in data.columns else None
     if vt_start:
         vt_idx = data.index.get_loc(vt_start)
         start_idx = max(start_idx, vt_idx)
@@ -436,7 +437,6 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
     hold_counts = defaultdict(float)
     prev_pos = {}
     
-    # [修改點] 實作 T+1 開盤市價單結算微結構
     for i in range(start_idx, len(dates)):
         today = dates[i]
         yesterday = dates[i-1]
@@ -459,19 +459,27 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
         if w_risk > 0: curr_pos[target_risky] = w_risk
         if w_safe > 0: curr_pos[target_safe] = w_safe
         
-        overnight_ret = 0.0
+        drifted_pos = {}
+        total_val = 0.0
         for asset, w_prev in prev_pos.items():
             r_on_col = f"{asset}_Ret_ON"
             r_on = data[r_on_col].iloc[i] if r_on_col in data.columns else 0
             if np.isnan(r_on): r_on = 0
-            overnight_ret += w_prev * r_on
+            val = w_prev * (1 + r_on)
+            drifted_pos[asset] = val
+            total_val += val
+            
+        overnight_ret = total_val - 1.0 if prev_pos else 0.0
+        
+        if total_val > 0:
+            for asset in drifted_pos: drifted_pos[asset] /= total_val
             
         cost = 0.0
-        all_assets = set(list(prev_pos.keys()) + list(curr_pos.keys()))
+        all_assets = set(list(drifted_pos.keys()) + list(curr_pos.keys()))
         for asset in all_assets:
-            w_prev = prev_pos.get(asset, 0.0)
-            w_curr = curr_pos.get(asset, 0.0)
-            if w_prev != w_curr: cost += abs(w_curr - w_prev) * TRANSACTION_COST
+            w_d = drifted_pos.get(asset, 0.0)
+            w_t = curr_pos.get(asset, 0.0)
+            if w_d != w_t: cost += abs(w_t - w_d) * TRANSACTION_COST
             
         intraday_ret = 0.0
         for asset, w_curr in curr_pos.items():
@@ -480,7 +488,7 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
             if np.isnan(r_id): r_id = 0
             intraday_ret += w_curr * r_id
             
-        day_ret = ((1 + overnight_ret - cost) * (1 + intraday_ret)) - 1
+        day_ret = ((1 + overnight_ret) * (1 - cost) * (1 + intraday_ret)) - 1
         
         strategy_ret.append(day_ret)
         valid_dates.append(today)
@@ -510,8 +518,8 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
         curr = val.iloc[-1]
         
     vt_eq = pd.Series(1.0, index=valid_dates)
-    if 'VT' in data.columns:
-        vt_ret = data['VT'].loc[valid_dates].pct_change().fillna(0)
+    if 'IOO' in data.columns:
+        vt_ret = data['IOO'].loc[valid_dates].pct_change().fillna(0)
         vt_eq = (1 + vt_ret).cumprod()
         
     return cum_eq, b_eq, vt_eq, hold_counts
@@ -599,7 +607,7 @@ with st.expander("📖 策略詳細規則 (黃金規格書)", expanded=False):
     
     ### 4. 嚴格交易微結構 (Microstructure & Friction)
     * **真實 3x 融資成本**：精確扣除 ETF 管理費 (0.95%) + **2 倍** 總報酬交換合約 (TRS) 利息（動態聯邦基金利率 + 1.0% 利差）。
-    * **T+1 開盤執行 (MOO)**：T 日收盤結算訊號，T+1 日開盤市價執行，嚴格承擔隔夜跳空風險。
+    * **T+1 開盤執行 (MOO)**：T 日收盤結算訊號，T+1 日開盤市價執行，嚴格承擔隔夜跳空風險與權重漂移耗損。
     * **交易滑價**：單邊 **0.1% (10 bps)** 手續費與衝擊成本。
     """)
 
@@ -634,7 +642,7 @@ st.divider()
 # 5. 回測區塊
 # ==========================================
 st.header("⏳ 嚴格微結構滾動回測 (T+1 MOO & TRS Costs)")
-st.caption("回測數據使用 1x 原型 ETF 合成，並扣除真實 3x 槓桿融資利息與交易滑價。")
+st.caption("回測數據使用 1x 原型 ETF 合成，並扣除真實 3x 槓桿融資利息與交易滑價。基準指數替換為 IOO (Global 100) 以對齊 2008 年起點。")
 
 syn_data = get_synthetic_backtest_data()
 
@@ -666,7 +674,7 @@ if not syn_data.empty:
             r5_b = b_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1).mean()
             r5_v = v_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1).mean()
 
-            st.write("### 📈 績效指標")
+            st.write(f"### 📈 績效指標 (回測起迄: {s_eq.index[0].strftime('%Y-%m-%d')} ~ {s_eq.index[-1].strftime('%Y-%m-%d')})")
             m1, m2, m3, m4, m5, m6 = st.columns(6)
             
             def m_box(label, v, b, vt, fmt="{:.2%}"):
@@ -674,7 +682,7 @@ if not syn_data.empty:
                 <div class="metric-card">
                     <p class="metric-label">{label}</p>
                     <p class="metric-value">{fmt.format(v)}</p>
-                    <p class="metric-sub">3x: {fmt.format(b)} | VT: {fmt.format(vt)}</p>
+                    <p class="metric-sub">3x: {fmt.format(b)} | IOO: {fmt.format(vt)}</p>
                 </div>""", unsafe_allow_html=True)
                 
             with m1: m_box("CAGR", s_s[0], b_s[0], v_s[0])
@@ -690,7 +698,7 @@ if not syn_data.empty:
             st.divider()
             
             st.write("### 📊 權益曲線")
-            df_chart = pd.DataFrame({'Date': s_eq.index, 'Strategy': s_eq, 'Bench (3x)': b_eq, 'VT': v_eq}).melt('Date', var_name='Asset', value_name='NAV')
+            df_chart = pd.DataFrame({'Date': s_eq.index, 'Strategy': s_eq, 'Bench (3x)': b_eq, 'IOO': v_eq}).melt('Date', var_name='Asset', value_name='NAV')
             c1 = alt.Chart(df_chart).mark_line().encode(
                 x='Date', y=alt.Y('NAV', scale=alt.Scale(type='log')), 
                 color='Asset', tooltip=['Date','Asset', alt.Tooltip('NAV', format='.2f')]
@@ -703,7 +711,7 @@ if not syn_data.empty:
                 dd_s = s_eq/s_eq.cummax()-1
                 dd_b = b_eq/b_eq.cummax()-1
                 dd_v = v_eq/v_eq.cummax()-1
-                df_dd = pd.DataFrame({'Date': s_eq.index, 'Strategy': dd_s, 'Bench (3x)': dd_b, 'VT': dd_v}).melt('Date', var_name='Asset', value_name='DD')
+                df_dd = pd.DataFrame({'Date': s_eq.index, 'Strategy': dd_s, 'Bench (3x)': dd_b, 'IOO': dd_v}).melt('Date', var_name='Asset', value_name='DD')
                 c2 = alt.Chart(df_dd).mark_line().encode(
                     x='Date', y=alt.Y('DD', axis=alt.Axis(format='%')), 
                     color='Asset', tooltip=['Date','Asset', alt.Tooltip('DD', format='.2%')]
@@ -715,7 +723,7 @@ if not syn_data.empty:
                 roll_s = s_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1)
                 roll_b = b_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1)
                 roll_v = v_eq.rolling(1260).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(252/1260)-1)
-                df_r5 = pd.DataFrame({'Date': s_eq.index, 'Strategy': roll_s, 'Bench (3x)': roll_b, 'VT': roll_v}).melt('Date', var_name='Asset', value_name='Roll5Y')
+                df_r5 = pd.DataFrame({'Date': s_eq.index, 'Strategy': roll_s, 'Bench (3x)': roll_b, 'IOO': roll_v}).melt('Date', var_name='Asset', value_name='Roll5Y')
                 c3 = alt.Chart(df_r5.dropna()).mark_line().encode(
                     x='Date', y=alt.Y('Roll5Y', axis=alt.Axis(format='%')), 
                     color='Asset', tooltip=['Date','Asset', alt.Tooltip('Roll5Y', format='.2%')]
