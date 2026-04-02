@@ -415,9 +415,12 @@ def calculate_backtest_signals_rolling(data):
     z = risk_adj.sub(risk_adj.mean(axis=1), axis=0).div(risk_adj.std(axis=1)+1e-6, axis=0)
     hist_winners = z.fillna(0).idxmax(axis=1)
     
+    # [BUG FIX]: 避開 pct_change(12) 產生的全 NaN 列導致的 idxmax 崩潰
     avail_safe = [t for t in SAFE_POOL if t in data.columns]
     safe_monthly = get_monthly_data(data[avail_safe])
-    hist_safe = safe_monthly.pct_change(12).idxmax(axis=1).fillna('TLT')
+    safe_ret_12m = safe_monthly.pct_change(12)
+    hist_safe = safe_ret_12m.dropna(how='all').idxmax(axis=1)
+    hist_safe = hist_safe.reindex(safe_monthly.index).fillna('TLT')
     
     return h_risk_weights, hist_winners, hist_safe
 
