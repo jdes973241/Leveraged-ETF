@@ -68,7 +68,7 @@ SMA_MONTHS = 6
 LIVE_GARCH_WINDOW = 504      
 BACKTEST_GARCH_WINDOW = 504  
 REFIT_STEP = 5               
-MOM_PERIODS = [12]           
+MOM_PERIODS = [3, 6, 9, 12]  # [進攻端] 複合動能時間矩陣
 TRANSACTION_COST = 0.001 
 RF_RATE = 0.02 
 
@@ -231,34 +231,44 @@ def calculate_live_selection(data):
             if ref_date not in monthly.index: continue
             p_now = monthly.loc[ref_date, ticker]
             
-            m = MOM_PERIODS[0]
-            loc = monthly.index.get_loc(ref_date)
-            if loc >= m:
-                p_prev = monthly.iloc[loc-m][ticker]
-                if pd.isna(p_prev) or p_prev == 0: row[f'Ret_{m}M'] = np.nan
-                else: row[f'Ret_{m}M'] = (p_now - p_prev) / p_prev
-            else: row[f'Ret_{m}M'] = np.nan
-            
+            # 取得 252 日年化波動率
             d_loc = data.index.get_indexer([ref_date], method='pad')[0]
             if d_loc >= 252:
                 subset = prices[ticker].iloc[d_loc-252 : d_loc]
                 row['Vol_Ann'] = subset.pct_change().std() * np.sqrt(252)
             else: row['Vol_Ann'] = np.nan
+
+            # 循環計算 3/6/9/12M 報酬
+            for m in MOM_PERIODS:
+                loc = monthly.index.get_loc(ref_date)
+                if loc >= m:
+                    p_prev = monthly.iloc[loc-m][ticker]
+                    if pd.isna(p_prev) or p_prev == 0: row[f'Ret_{m}M'] = np.nan
+                    else: row[f'Ret_{m}M'] = (p_now - p_prev) / p_prev
+                else: row[f'Ret_{m}M'] = np.nan
+                
             metrics.append(row)
         except: continue
         
     if not metrics: return pd.DataFrame(), None
     
     df = pd.DataFrame(metrics).set_index('Ticker')
-    m = MOM_PERIODS[0]
-    col = f'Ret_{m}M'
-    if col in df.columns:
-        risk_adj = df[col] / (df['Vol_Ann'] + 1e-6)
-        z = (risk_adj - risk_adj.mean()) / (risk_adj.std() + 1e-6)
-        df[f'Z_{m}M'] = z
-        df['Total_Z'] = z.fillna(0)
+    
+    # [更新] 剝除 Z-Score，直接使用各週期的 Raw Risk-Adjusted Return 平均
+    raw_scores = []
+    for m in MOM_PERIODS:
+        col = f'Ret_{m}M'
+        if col in df.columns:
+            risk_adj = df[col] / (df['Vol_Ann'] + 1e-6)
+            df[f'Raw_SR_{m}M'] = risk_adj
+            raw_scores.append(risk_adj)
+            
+    if raw_scores:
+        df['Total_Score'] = pd.concat(raw_scores, axis=1).mean(axis=1).fillna(0)
+    else:
+        df['Total_Score'] = 0.0
         
-    return df.sort_values('Total_Z', ascending=False), ref_date
+    return df.sort_values('Total_Score', ascending=False), ref_date
 
 def calculate_live_safe(data):
     if data.empty: return "TLT", pd.DataFrame(), None
@@ -285,11 +295,21 @@ def calculate_live_safe(data):
         return "TLT", pd.DataFrame(), None
     
     loc = monthly.index.get_loc(ref_date)
-    if loc >= 12: ret_12m = (monthly.iloc[loc] / monthly.iloc[loc-12]) - 1
-    else: ret_12m = pd.Series(0.0, index=avail_safe)
     
-    winner = ret_12m.idxmax()
-    details = pd.DataFrame({"Ticker": avail_safe, "12M Return": ret_12m.values}).set_index("Ticker")
+    # [更新] 避險池強制分離，死鎖 6+12M 原始超額報酬平均
+    avg_ret = pd.Series(0.0, index=avail_safe)
+    valid_m = 0
+    for m in [6, 12]:
+        if loc >= m:
+            ret_m = (monthly.iloc[loc] / monthly.iloc[loc-m]) - 1
+            avg_ret += ret_m
+            valid_m += 1
+            
+    if valid_m > 0: avg_ret /= valid_m
+    else: avg_ret = pd.Series(0.0, index=avail_safe)
+    
+    winner = avg_ret.idxmax()
+    details = pd.DataFrame({"Ticker": avail_safe, "Comp_Ret": avg_ret.values}).set_index("Ticker")
     return winner, details, ref_date
 
 # ==========================================
@@ -409,18 +429,26 @@ def calculate_backtest_signals_rolling(data):
     monthly_vol = get_monthly_data(daily_vol)
     monthly_vol.columns = monthly_src.columns
     
-    m = MOM_PERIODS[0]
-    ret = monthly_src.pct_change(m)
-    risk_adj = ret / (monthly_vol + 1e-6)
-    z = risk_adj.sub(risk_adj.mean(axis=1), axis=0).div(risk_adj.std(axis=1)+1e-6, axis=0)
-    hist_winners = z.fillna(0).idxmax(axis=1)
+    # [更新] 回測端進攻資產：剝除 Z-Score，使用 Raw Risk-Adjusted Return
+    raw_scores_dict = {}
+    for m in MOM_PERIODS:
+        ret = monthly_src.pct_change(m)
+        risk_adj = ret / (monthly_vol + 1e-6)
+        raw_scores_dict[m] = risk_adj.fillna(0)
+        
+    comp_raw = sum([raw_scores_dict[m] for m in MOM_PERIODS]) / len(MOM_PERIODS)
+    hist_winners = comp_raw.idxmax(axis=1)
     
-    # [BUG FIX]: 避開 pct_change(12) 產生的全 NaN 列導致的 idxmax 崩潰
+    # [更新] 回測端避險資產：強制鎖死 6+12M 原始絕對報酬平均
     avail_safe = [t for t in SAFE_POOL if t in data.columns]
     safe_monthly = get_monthly_data(data[avail_safe])
-    safe_ret_12m = safe_monthly.pct_change(12)
-    hist_safe = safe_ret_12m.dropna(how='all').idxmax(axis=1)
-    hist_safe = hist_safe.reindex(safe_monthly.index).fillna('TLT')
+    
+    safe_scores_dict = {}
+    for m in [6, 12]:
+        safe_scores_dict[m] = safe_monthly.pct_change(m).fillna(0)
+        
+    comp_safe = sum([safe_scores_dict[m] for m in [6, 12]]) / 2.0
+    hist_safe = comp_safe.dropna(how='all').idxmax(axis=1).reindex(safe_monthly.index).fillna('TLT')
     
     return h_risk_weights, hist_winners, hist_safe
 
@@ -531,7 +559,8 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
 # 4. Dashboard 介面
 # ==========================================
 st.title("🛡️ 雙重動能與動態風控 (機構實盤版)")
-st.caption(f"配置: 對稱夏普動能 [12M] / SMA {SMA_MONTHS}M / GARCH (Q{RISK_CONFIG['UPRO']['exit_q']*100:.0f}) / T+1 執行")
+# [更新] 標題對齊最新的非對稱引擎憲法
+st.caption(f"配置: 進攻 [3+6+9+12M 原始風險調整] / 避險 [6+12M 原始絕對報酬] / SMA {SMA_MONTHS}M / GARCH (Q{RISK_CONFIG['UPRO']['exit_q']*100:.0f})")
 
 with st.expander("🛠️ 數據除錯與狀態 (若數據為 N/A 請點此)"):
     live_data = get_live_data()
@@ -584,17 +613,17 @@ with st.expander("📖 策略詳細規則 (黃金規格書)", expanded=False):
     | **進攻 (Risky)** | **EDC** | EEM | 新興市場 |
     | **避險 (Safe)** | **GLD** / **TLT** | (自身) | 黃金 / 20年期美債 |
     
-    ### 2. 進攻資產選擇機制 (Alpha Selection)
-    策略每月進行一次選股，挑選當下動能最強的 **1 檔** 進攻資產。
-    * **頻率**：月頻（Monthly），於每個月最後一個交易日收盤後計算。
-    * **動能指標**：對稱夏普動能 (Matched-Period Risk-Adjusted Momentum Z-Score)。
-    * **計算步驟**：
-        1. **絕對報酬**：計算過去 **12 個月**的累積報酬率。
-        2. **對稱風險調整**：計算過去 **252 天（一年）**的年化波動率。將 12M 報酬除以 12M 波動率，得出對稱的 Sharpe-like Ratio。
-        3. **橫向標準化**：計算橫向 Z-Score（減去平均除以標準差），最高分者勝出。
+    ### 2. 動能選擇機制 (非對稱 Alpha 雙引擎)
+    策略每月進行一次選股，挑選當下動能最強的進攻/避險資產。
+    
+    **⚔️ 進攻端引擎：3+6+9+12M 原始風險調整動能 (奧卡姆剃刀版)**
+    * **邏輯**：平行計算過去 **3、6、9、12 個月**的累積報酬率。將每個週期的報酬率除以**過去 252 天（一年）的年化波動率**（訊號與風險估計解耦），得出對稱的 Sharpe-like Ratio。最終直接取四週期的**等權重平均分數 (Total Score)**，最高分者勝出。嚴格禁止 N=3 的小樣本橫向 Z-Score 扭曲。
+    
+    **🛡️ 避險端引擎：6+12M 原始複合絕對報酬**
+    * **邏輯**：避開夏普動能的「凸性悖論」，避險端直接計算過去 **6 個月與 12 個月**的絕對超額報酬並平均。此均勻濾波器能過濾 3M 的政策雜訊，並鎖定大部位的總經與利率週期。
     
     ### 3. 雙層動態風控機制 (Beta Risk Control)
-    透過兩層獨立風控決定曝險比例。每層貢獻 50% 權重（Ensemble 50/50），持倉水位為 **0%、50% 或 100%**。
+    透過兩層獨立風控決定進攻端的曝險比例。每層貢獻 50% 權重，持倉水位為 **0%、50% 或 100%**。
     
     **第一層：趨勢濾網 (Trend Filter) - 權重 50%**
     * **指標**：6 個月簡單移動平均線 (SMA 6 Months)。
@@ -622,8 +651,8 @@ with c2:
 with c3: 
     st.metric("GARCH 風控", "安全" if g_state==1 else "危險", delta="✅" if g_state==1 else "🔻")
 with c4: 
-    s_val = safe_df.loc[safe_win, '12M Return'] if not safe_df.empty else 0
-    st.metric("🛡️ 避險資產", safe_win, f"12M: {s_val:.1%}")
+    s_val = safe_df.loc[safe_win, 'Comp_Ret'] if not safe_df.empty else 0
+    st.metric("🛡️ 避險資產", safe_win, f"複合超額: {s_val:.1%}")
 
 st.divider()
 
@@ -635,7 +664,7 @@ with t2:
 with t3:
     if winner in risk_live:
         st.dataframe(risk_live[winner].tail(10)[['GARCH_State','SMA_State','Weight']], use_container_width=True)
-with t4: st.dataframe(sel_df.style.format("{:.2f}"), use_container_width=True)
+with t4: st.dataframe(sel_df.style.format("{:.4f}"), use_container_width=True)
 with t5: st.dataframe(safe_df.style.format("{:.2%}"), use_container_width=True)
 with t6: st.success(f"建議持有: **{final_w*100:.0f}% {winner}** + **{(1-final_w)*100:.0f}% {safe_win}**")
 
@@ -644,7 +673,7 @@ st.divider()
 # ==========================================
 # 5. 回測區塊
 # ==========================================
-st.header("⏳ 嚴格微結構滾動回測 (T+1 MOO & TRS Costs)")
+st.header("⏳ 嚴格微結構滾回測 (T+1 MOO & TRS Costs)")
 st.caption("回測數據使用 1x 原型 ETF 合成，並扣除真實 3x 槓桿融資利息與交易滑價。基準指數替換為 IOO (Global 100) 以對齊 2008 年起點。")
 
 syn_data = get_synthetic_backtest_data()
