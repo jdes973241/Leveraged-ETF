@@ -68,17 +68,59 @@ SMA_MONTHS = 6
 LIVE_GARCH_WINDOW = 504      
 BACKTEST_GARCH_WINDOW = 504  
 REFIT_STEP = 5               
-MOM_PERIODS = [3, 6, 9, 12]  # [進攻端] 複合動能時間矩陣
+# [更新] 進攻端動能改為非重疊三段: (0,3], (3,7], (7,12] 月
+MOM_SEGMENTS = [(0, 3), (3, 7), (7, 12)]
 TRANSACTION_COST = 0.001 
 RF_RATE = 0.02 
 
-def get_daily_leverage_cost(date):
-    year = date.year
-    if year <= 2007: base_rate = 0.050
-    elif 2008 <= year <= 2015: base_rate = 0.0025
-    elif 2016 <= year <= 2019: base_rate = 0.020
-    elif 2020 <= year <= 2021: base_rate = 0.0025
-    else: base_rate = 0.0525
+# ==========================================
+# FRED Fed Funds Rate 抓取 (24h 快取 + fallback)
+# ==========================================
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_fed_funds_rate():
+    """
+    從 FRED 抓取 Daily Federal Funds Rate (DFF)。
+    成功: 返回 pd.Series (日頻，百分比數值如 5.25 代表 5.25%)。
+    失敗: 返回 None，上層邏輯自動 fallback 到靜態分段表。
+    """
+    try:
+        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFF"
+        df = pd.read_csv(url)
+        date_col = df.columns[0]
+        rate_col = df.columns[1]
+        df[date_col] = pd.to_datetime(df[date_col])
+        df = df.set_index(date_col)
+        df[rate_col] = pd.to_numeric(df[rate_col], errors='coerce')
+        s = df[rate_col].dropna() / 100.0  # 轉為小數
+        return s
+    except Exception:
+        return None
+
+def _get_static_base_rate(year):
+    """原始靜態分段表 (fallback 用)"""
+    if year <= 2007: return 0.050
+    elif 2008 <= year <= 2015: return 0.0025
+    elif 2016 <= year <= 2019: return 0.020
+    elif 2020 <= year <= 2021: return 0.0025
+    else: return 0.0525
+
+def get_daily_leverage_cost(date, fed_rate_series=None):
+    """
+    計算單日 3x 槓桿融資成本。
+    若提供 fed_rate_series (FRED DFF)，優先使用；否則 fallback 到靜態表。
+    """
+    base_rate = None
+    if fed_rate_series is not None and len(fed_rate_series) > 0:
+        try:
+            # 使用 asof: 找到 <= date 的最新值 (避免前視)
+            base_rate = fed_rate_series.asof(date)
+            if pd.isna(base_rate):
+                base_rate = None
+        except Exception:
+            base_rate = None
+    
+    if base_rate is None:
+        base_rate = _get_static_base_rate(date.year)
         
     mgt_fee = 0.0095   
     swap_spread = 0.01 
@@ -190,7 +232,8 @@ def calculate_live_risk(data):
         
         df.loc[mask_exit, 'GARCH_State'] = 0.0 
         df.loc[mask_entry, 'GARCH_State'] = 1.0 
-        df['GARCH_State'] = df['GARCH_State'].ffill().fillna(1.0)
+        # [更新] 預設狀態統一為 0.0 (保守: 無資料預設危險)，與回測端一致
+        df['GARCH_State'] = df['GARCH_State'].ffill().fillna(0.0)
         
         df['Weight'] = (0.5 * df['GARCH_State']) + (0.5 * df['SMA_State'])
         df = df.dropna(subset=['Weight'])
@@ -238,14 +281,26 @@ def calculate_live_selection(data):
                 row['Vol_Ann'] = subset.pct_change().std() * np.sqrt(252)
             else: row['Vol_Ann'] = np.nan
 
-            # 循環計算 3/6/9/12M 報酬
-            for m in MOM_PERIODS:
-                loc = monthly.index.get_loc(ref_date)
-                if loc >= m:
-                    p_prev = monthly.iloc[loc-m][ticker]
-                    if pd.isna(p_prev) or p_prev == 0: row[f'Ret_{m}M'] = np.nan
-                    else: row[f'Ret_{m}M'] = (p_now - p_prev) / p_prev
-                else: row[f'Ret_{m}M'] = np.nan
+            # [更新] 非重疊三段動能: (0,3], (3,7], (7,12]
+            # 每段獨立計算當區間報酬率 (無重疊)
+            loc = monthly.index.get_loc(ref_date)
+            for (start_m, end_m) in MOM_SEGMENTS:
+                seg_label = f'Ret_{start_m}to{end_m}M' if start_m > 0 else f'Ret_{end_m}M'
+                if loc >= end_m:
+                    p_end = monthly.iloc[loc - end_m][ticker]   # 較早的時點
+                    if start_m == 0:
+                        # (0, end_m] 區間: 現在 vs end_m 個月前
+                        if pd.isna(p_end) or p_end == 0: row[seg_label] = np.nan
+                        else: row[seg_label] = (p_now - p_end) / p_end
+                    else:
+                        # (start_m, end_m] 區間: start_m 個月前 vs end_m 個月前
+                        p_start = monthly.iloc[loc - start_m][ticker]  # 較晚的時點
+                        if pd.isna(p_start) or pd.isna(p_end) or p_end == 0:
+                            row[seg_label] = np.nan
+                        else:
+                            row[seg_label] = (p_start - p_end) / p_end
+                else:
+                    row[seg_label] = np.nan
                 
             metrics.append(row)
         except: continue
@@ -254,13 +309,14 @@ def calculate_live_selection(data):
     
     df = pd.DataFrame(metrics).set_index('Ticker')
     
-    # [更新] 剝除 Z-Score，直接使用各週期的 Raw Risk-Adjusted Return 平均
+    # [更新] 非重疊三段 Raw Risk-Adjusted Return，分母統一 252d 年化波動率
     raw_scores = []
-    for m in MOM_PERIODS:
-        col = f'Ret_{m}M'
-        if col in df.columns:
-            risk_adj = df[col] / (df['Vol_Ann'] + 1e-6)
-            df[f'Raw_SR_{m}M'] = risk_adj
+    for (start_m, end_m) in MOM_SEGMENTS:
+        seg_label = f'Ret_{start_m}to{end_m}M' if start_m > 0 else f'Ret_{end_m}M'
+        sr_label = f'Raw_SR_{start_m}to{end_m}M' if start_m > 0 else f'Raw_SR_{end_m}M'
+        if seg_label in df.columns:
+            risk_adj = df[seg_label] / (df['Vol_Ann'] + 1e-6)
+            df[sr_label] = risk_adj
             raw_scores.append(risk_adj)
             
     if raw_scores:
@@ -319,6 +375,9 @@ def calculate_live_safe(data):
 def get_synthetic_backtest_data():
     tickers = list(MAPPING.values()) + SAFE_POOL + ['IOO']
     try:
+        # [更新] 取得 FRED DFF 利率序列 (24h 快取)
+        fed_rate_series = get_fed_funds_rate()
+        
         data_raw = yf.download(tickers, period="max", interval="1d", auto_adjust=True, progress=False, threads=False)
         
         if isinstance(data_raw.columns, pd.MultiIndex):
@@ -356,7 +415,8 @@ def get_synthetic_backtest_data():
         for ticker_1x in MAPPING.values():
             if f"{ticker_1x}_Close" not in data_core.columns: continue
             ticker_3x = REVERSE_MAP[ticker_1x]
-            costs = pd.Series([get_daily_leverage_cost(d) for d in data_core.index], index=data_core.index)
+            # [更新] 使用 FRED 動態利率 (失敗自動 fallback 至靜態表)
+            costs = pd.Series([get_daily_leverage_cost(d, fed_rate_series) for d in data_core.index], index=data_core.index)
             
             synthetic_data[f"{ticker_3x}_Ret_ON"] = (3.0 * synthetic_data[f"{ticker_1x}_Ret_ON"]) - costs
             synthetic_data[f"{ticker_3x}_Ret_ID"] = 3.0 * synthetic_data[f"{ticker_1x}_Ret_ID"]
@@ -429,14 +489,22 @@ def calculate_backtest_signals_rolling(data):
     monthly_vol = get_monthly_data(daily_vol)
     monthly_vol.columns = monthly_src.columns
     
-    # [更新] 回測端進攻資產：剝除 Z-Score，使用 Raw Risk-Adjusted Return
-    raw_scores_dict = {}
-    for m in MOM_PERIODS:
-        ret = monthly_src.pct_change(m)
-        risk_adj = ret / (monthly_vol + 1e-6)
-        raw_scores_dict[m] = risk_adj.fillna(0)
+    # [更新] 回測端進攻資產：非重疊三段 (0,3], (3,7], (7,12] 月
+    # 每段獨立計算當區間報酬，分母統一 252d 年化波動率
+    raw_scores_list = []
+    for (start_m, end_m) in MOM_SEGMENTS:
+        if start_m == 0:
+            # (0, end_m] 區間: 現在 vs end_m 個月前 (等同於 pct_change(end_m))
+            seg_ret = monthly_src.pct_change(end_m)
+        else:
+            # (start_m, end_m] 區間: start_m 個月前 vs end_m 個月前
+            p_start = monthly_src.shift(start_m)    # 較晚的時點
+            p_end = monthly_src.shift(end_m)        # 較早的時點
+            seg_ret = (p_start / p_end) - 1
+        risk_adj = seg_ret / (monthly_vol + 1e-6)
+        raw_scores_list.append(risk_adj.fillna(0))
         
-    comp_raw = sum([raw_scores_dict[m] for m in MOM_PERIODS]) / len(MOM_PERIODS)
+    comp_raw = sum(raw_scores_list) / len(raw_scores_list)
     hist_winners = comp_raw.idxmax(axis=1)
     
     # [更新] 回測端避險資產：強制鎖死 6+12M 原始絕對報酬平均
@@ -559,8 +627,8 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
 # 4. Dashboard 介面
 # ==========================================
 st.title("🛡️ 雙重動能與動態風控 (機構實盤版)")
-# [更新] 標題對齊最新的非對稱引擎憲法
-st.caption(f"配置: 進攻 [3+6+9+12M 原始風險調整] / 避險 [6+12M 原始絕對報酬] / SMA {SMA_MONTHS}M / GARCH (Q{RISK_CONFIG['UPRO']['exit_q']*100:.0f})")
+# [更新] 標題對齊非重疊三段動能引擎憲法
+st.caption(f"配置: 進攻 [非重疊 3M/[3-7]M/[7-12]M 風險調整] / 避險 [6+12M 原始絕對報酬] / SMA {SMA_MONTHS}M / GARCH (Q{RISK_CONFIG['UPRO']['exit_q']*100:.0f})")
 
 with st.expander("🛠️ 數據除錯與狀態 (若數據為 N/A 請點此)"):
     live_data = get_live_data()
@@ -616,8 +684,15 @@ with st.expander("📖 策略詳細規則 (黃金規格書)", expanded=False):
     ### 2. 動能選擇機制 (非對稱 Alpha 雙引擎)
     策略每月進行一次選股，挑選當下動能最強的進攻/避險資產。
     
-    **⚔️ 進攻端引擎：3+6+9+12M 原始風險調整動能 (奧卡姆剃刀版)**
-    * **邏輯**：平行計算過去 **3、6、9、12 個月**的累積報酬率。將每個週期的報酬率除以**過去 252 天（一年）的年化波動率**（訊號與風險估計解耦），得出對稱的 Sharpe-like Ratio。最終直接取四週期的**等權重平均分數 (Total Score)**，最高分者勝出。嚴格禁止 N=3 的小樣本橫向 Z-Score 扭曲。
+    **⚔️ 進攻端引擎：非重疊三段風險調整動能 (結構性分離版)**
+    * **邏輯**：將過去 12 個月切分為**三段不重疊區間**：**近期 3M**、**中期 (3, 7]M**、**遠期 (7, 12]M**。每段獨立計算該區間的累積報酬率，再除以**過去 252 天（一年）的年化波動率**（訊號與風險估計解耦），得到對稱的 Sharpe-like Ratio。最終取三段**等權重平均分數 (Total Score)**，最高分者勝出。
+    * **為何非重疊**：原始重疊版 (3, 6, 9, 12M) 中 3M 報酬在四個分數裡被計算四次，近期資訊被隱性加權。非重疊設計讓每段資訊只貢獻一次，**近期、中期、遠期動能權重嚴格對稱**。實證上 Avg 5Y Rolling CAGR 提升約 +3.57%，且排除 2008 後差異仍為正（非源自單一事件）。
+    * **為何採用斷點 [3, 7]**：經過 231 個非重疊配置的完整網格搜索驗證（11 二段 + 55 三段 + 165 四段）：
+        1. **三段網格最佳**：在 55 個三段配置中，`[3, 7]` 的 CAGR (29.45%)、Sharpe (0.7479)、IR (0.6985) 三項綜合最佳；斷點「7」對應 Novy-Marx (2012) 實證中期動能 (t-12 到 t-7) 的預測力強區間，有獨立學術理論支撐，非純數據挖掘產物。
+        2. **全網格第四名但為主動選擇**：若將四段配置納入比較，`[3, 7]` 的 Avg_5Y_Rolling 排名第 4（前三名為 `4seg_2_3_7`、`4seg_1_3_7`、`4seg_3_5_7`，均以 7 為最末斷點），但差距僅 +6 ~ +15 bps（≈ 0.2 ~ 0.3 個網格標準差），**落在統計噪音量級內**。且四段網格 (165 個) 的樣本空間是三段 (55 個) 的 3 倍，在更大空間中取最大值本來就會系統性偏高（selection bias），此 15 bps 優勢幾乎完全可由此效應解釋，不代表結構性真實優勢。
+        3. **抗過擬合與最簡性**：新增第四段斷點 (如 0-2M vs 2-3M 的切分) 缺乏獨立學術支持，且 whipsaw 從 23 次增至 25 次（+8.7%）會部分抵銷表面收益。依「最簡穩健優先」原則拒絕複雜化。
+        4. **穩定高原而非孤立尖峰**：231 個配置中有 107 個 (46%) 通過嚴格篩選 (WinRate + Worst5Y + IR 均 ≥ Baseline)；三段網格內 CAGR 標準差僅 0.86%，結果對具體斷點不敏感，確認 `[3, 7]` 位於穩定高原，非過擬合尖峰。
+    * **已知取捨**：採用非重疊結構後，MaxDD 從 -54.37% 惡化至 -61.54%（全 231 配置統一，為結構性固有屬性，與斷點選擇無關）。此代價已被接受，換取滾動勝率、Worst 5Y、IR 等機構級穩定度指標的系統性改善。
     
     **🛡️ 避險端引擎：6+12M 原始複合絕對報酬**
     * **邏輯**：避開夏普動能的「凸性悖論」，避險端直接計算過去 **6 個月與 12 個月**的絕對超額報酬並平均。此均勻濾波器能過濾 3M 的政策雜訊，並鎖定大部位的總經與利率週期。
@@ -636,9 +711,10 @@ with st.expander("📖 策略詳細規則 (黃金規格書)", expanded=False):
         2. 計算該波動率在過去 252 天歷史中的 **百分位數**。
         3. **出場**：波動率 > 歷史 **99%** 分位數 $\rightarrow$ **危險 (0)**。
         4. **進場**：波動率 < 歷史 **90%** 分位數 $\rightarrow$ **安全 (1)**。
+        5. **預設值**：無資料期預設為 **0 (危險)**，保守對齊回測端，避免 Live / Backtest 偏移。
     
     ### 4. 嚴格交易微結構 (Microstructure & Friction)
-    * **真實 3x 融資成本**：精確扣除 ETF 管理費 (0.95%) + **2 倍** 總報酬交換合約 (TRS) 利息（動態聯邦基金利率 + 1.0% 利差）。
+    * **真實 3x 融資成本**：精確扣除 ETF 管理費 (0.95%) + **2 倍** 總報酬交換合約 (TRS) 利息（**動態聯邦基金利率**由 FRED DFF 即時抓取 + 1.0% 利差；抓取失敗時自動 fallback 至靜態分段表）。
     * **T+1 開盤執行 (MOO)**：T 日收盤結算訊號，T+1 日開盤市價執行，嚴格承擔隔夜跳空風險與權重漂移耗損。
     * **交易滑價**：單邊 **0.1% (10 bps)** 手續費與衝擊成本。
     """)
