@@ -218,7 +218,7 @@ def calculate_live_risk(data):
         df['Vol'] = pd.Series(forecasts).reindex(df.index)
         
         if signal_t in daily_sma_sig.columns: df['SMA_State'] = daily_sma_sig[signal_t]
-        else: df['SMA_State'] = 1.0 
+        else: df['SMA_State'] = 0.0  # [修正 B-4] 對齊 GARCH 保守原則：資料異常時預設危險
         
         cfg = RISK_CONFIG[trade_t]
         df['Exit_Th'] = df['Vol'].rolling(252).quantile(cfg['exit_q']).shift(1)
@@ -426,7 +426,10 @@ def get_synthetic_backtest_data():
             synthetic_data[f"RAW_{ticker_3x}"] = data_core[f"{ticker_1x}_Close"] 
             
         return synthetic_data.dropna()
-    except: return pd.DataFrame()
+    except Exception as e:
+        # [修正 A-1] 不再吞掉所有錯誤；顯示具體例外以利 debug
+        st.error(f"合成回測資料失敗: {type(e).__name__}: {e}")
+        return pd.DataFrame()
 
 @st.cache_data(ttl=3600, show_spinner="計算滾動回測訊號 (這需要約 1 分鐘)...")
 def calculate_backtest_signals_rolling(data):
@@ -602,19 +605,35 @@ def run_backtest_logic(data, risk_weights, winners_series, safe_signals):
     
     b_cols = [c for c in list(MAPPING.keys()) if c in data.columns]
     b_sub = data[b_cols].loc[valid_dates].copy()
-    b_eq = pd.Series(1.0, index=b_sub.index)
-    curr = 1.0
-    q_ends = b_sub.groupby(pd.Grouper(freq='QE')).apply(lambda x: x.index[-1] if len(x)>0 else None).dropna()
-    cps = sorted(list(set([b_sub.index[0]] + list(q_ends) + [b_sub.index[-1]])))
-    for i in range(len(cps)-1):
-        t_s, t_e = cps[i], cps[i+1]
-        if t_s >= t_e: continue
-        seg = b_sub.loc[t_s:t_e]
-        if len(seg)<2: continue
-        rel = seg.div(seg.iloc[0])
-        val = rel.mean(axis=1) * curr
-        b_eq.loc[t_s:t_e] = val
-        curr = val.iloc[-1]
+    # [修正 A-2] 3x 等權重季度再平衡邏輯重寫
+    # 原邏輯使用 loc[t_s:t_e] 閉區間，跨季邊界日會被相鄰兩段覆寫，造成微幅偏誤。
+    # 新邏輯使用日報酬 + 漂移權重 + 季底再平衡，數學上嚴格無重複計算。
+    b_returns = b_sub.pct_change().fillna(0)
+    q_ends_set = set(b_sub.groupby(pd.Grouper(freq='QE')).apply(
+        lambda x: x.index[-1] if len(x) > 0 else None).dropna().tolist())
+    N = len(b_cols)
+    if N > 0:
+        weights = np.ones(N) / N  # 起始等權重
+        b_eq = pd.Series(1.0, index=b_sub.index)
+        curr_nav = 1.0
+        for j, today in enumerate(b_sub.index):
+            if j == 0:
+                b_eq.iloc[j] = curr_nav
+                continue
+            today_rets = b_returns.iloc[j].values  # 各資產今日報酬
+            port_ret = float(np.dot(weights, today_rets))  # 加權報酬
+            curr_nav *= (1 + port_ret)
+            b_eq.iloc[j] = curr_nav
+            # 權重漂移
+            weights = weights * (1 + today_rets)
+            w_sum = weights.sum()
+            if w_sum > 0:
+                weights = weights / w_sum
+            # 季底再平衡回 1/N
+            if today in q_ends_set:
+                weights = np.ones(N) / N
+    else:
+        b_eq = pd.Series(1.0, index=b_sub.index)
         
     vt_eq = pd.Series(1.0, index=valid_dates)
     if 'IOO' in data.columns:
@@ -765,7 +784,10 @@ if not syn_data.empty:
         if s_eq is not None:
             def calc_stats(eq, dr):
                 d = (eq.index[-1] - eq.index[0]).days
-                cagr = (eq.iloc[-1]) ** (365.25/d) - 1
+                # [修正 B-3] CAGR 使用實際起始值，不假設 eq.iloc[0]=1.0
+                # 原 (eq.iloc[-1]) ** (365.25/d) 假設起始為 1.0，但 cumprod() 起始 ≈ 1+第一日報酬
+                start_val = max(eq.iloc[0], 1e-10)  # 防止除零
+                cagr = (eq.iloc[-1] / start_val) ** (365.25/max(d, 1)) - 1
                 mdd = (eq / eq.cummax() - 1).min()
                 excess = dr - (RF_RATE/252)
                 sharpe = (excess.mean()/excess.std())*np.sqrt(252)
