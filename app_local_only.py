@@ -72,6 +72,11 @@ SMA_MONTHS = 6
 LIVE_GARCH_WINDOW = 504      
 BACKTEST_GARCH_WINDOW = 504  
 REFIT_STEP = 5               
+# [anchor 防護] GARCH refit 以 data.index 絕對位置錨定 (Live 與回測對齊)。
+# 若 yfinance 修訂歷史、改變資料起點, 絕對位置會整體偏移, refit 點錯位。
+# 下列基準用於偵測起點漂移並示警。起點由最晚上市標的 (VGK/EURL) 決定, 歷來穩定。
+EXPECTED_DATA_START = pd.Timestamp("2005-03-11")
+ANCHOR_TOLERANCE_DAYS = 7    # 容忍假日/小幅調整
 # [更新] 進攻端動能改為非重疊三段: (0,3], (3,7], (7,12] 月
 MOM_SEGMENTS = [(0, 3), (3, 7), (7, 12)]
 TRANSACTION_COST = 0.001 
@@ -177,6 +182,22 @@ def get_live_data():
         st.error(f"數據下載失敗: {e}")
         return pd.DataFrame()
 
+def check_data_anchor(data):
+    """[anchor 防護] 偵測 data.index 起點漂移。
+    GARCH refit 以 data.index 絕對位置錨定 (與回測端 (t-504)%5 對齊)。若 yfinance
+    修訂歷史、新增更早交易日, 起點漂移會使歷史 refit 點整體偏移, 造成 Live 與回測
+    訊號錯位、歷史 vol 整體跳變。返回 warning 字串或 None。純監控, 不改變計算邏輯。"""
+    if data is None or data.empty:
+        return None
+    actual_start = data.index[0]
+    drift = abs((actual_start - EXPECTED_DATA_START).days)
+    if drift > ANCHOR_TOLERANCE_DAYS:
+        return (f"資料起點 {actual_start.date()} 偏離預期基準 {EXPECTED_DATA_START.date()} "
+                f"達 {drift} 天。GARCH refit 觸發點以 data.index 絕對位置錨定, 起點漂移會使 "
+                f"Live 與回測的 refit 對齊失準、歷史波動率整體跳變。請檢查資料來源, "
+                f"確認新起點正確後更新程式碼中的 EXPECTED_DATA_START。")
+    return None
+
 def calculate_live_risk(data):
     if data.empty: return {}
     avail_cols = [c for c in list(MAPPING.keys()) if c in data.columns]
@@ -203,10 +224,20 @@ def calculate_live_risk(data):
         dates = window.index
         loop_start = LIVE_GARCH_WINDOW
         
+        # [索引漂移修正] 用 data.index 絕對位置判斷 refit, 與回測端 (t-504)%5 對齊。
+        # 現狀 bug: window=tail(N) 每次刷新後同一日期的相對索引 t 縮小, 導致
+        # (t-loop_start)%REFIT_STEP 漂移, 同一天的 vol 被回頭改寫。改用絕對位置鎖死。
+        ref_pos = data.index.get_indexer(dates)
+        
         for t in range(loop_start, len(window)):
             train = window.iloc[t - LIVE_GARCH_WINDOW + 1 : t + 1]
             if len(train) < 50: continue
-            if (t - loop_start) % REFIT_STEP == 0 or model_res is None:
+            abs_pos = ref_pos[t]
+            if abs_pos >= 0:
+                refit_due = (abs_pos - LIVE_GARCH_WINDOW) % REFIT_STEP == 0
+            else:
+                refit_due = (t - loop_start) % REFIT_STEP == 0  # 保護: 日期不在 data.index
+            if refit_due or model_res is None:
                 try:
                     am = arch_model(train, vol='Garch', p=1, q=1, dist='t', rescale=False)
                     model_res = am.fit(disp='off', show_warning=False)
@@ -674,6 +705,11 @@ with st.expander("🛠️ 數據除錯與狀態 (若數據為 N/A 請點此)"):
         st.success("✅ 數據下載流程完成")
 
 # --- Live Data Loading ---
+# [anchor 防護] 偵測資料起點漂移, 若 refit 對齊可能失準則示警
+_anchor_warn = check_data_anchor(live_data)
+if _anchor_warn:
+    st.warning(f"⚠️ GARCH 對齊警示：{_anchor_warn}")
+
 risk_live = calculate_live_risk(live_data)
 sel_df, sel_date = calculate_live_selection(live_data)
 safe_win, safe_df, safe_date = calculate_live_safe(live_data)
@@ -828,6 +864,26 @@ with st.expander("📖 策略詳細規則 (黃金規格書)", expanded=False):
     * 配置 `A3_any_mid_B6_C378` (任一風控警示時 0.25/0.25 weight + 6M SMA + 378 日 GARCH quantile window) 列為「未來實盤監控候選」
     * 若未來實盤期間此配置持續勝出，未來版本可重新評估切換
     * 此配置代表「Risk-Reward Pareto 改進方向」但需更多真實數據確認
+    
+    **方向 F：GARCH Live/回測一致性 (物理致盲對決 + 索引漂移修正)**
+    
+    起因: 實盤發現 6/5 大跌後, 同一天的 GARCH vol 在 6/8 顯示 23.03 (低), 6/9 卻變成 51.07 (超閾值)。
+    
+    **診斷出兩個獨立問題**:
+    * **索引漂移 (歷史重繪)**: Live 端 `window = ret.dropna().tail(N)` 每次刷新往後移一天, 同一日期在 window 中的相對索引 `t` 縮小, 使 `(t - loop_start) % REFIT_STEP` 漂移, 同一天的 refit 狀態在不同刷新日跳動 → vol 被回頭改寫。**確定性 bug**。
+    * **物理致盲 (Stale Forecast)**: arch 套件在非 refit 日呼叫舊 `model_res.forecast()`, conditional variance 不反映新資料 → 大跌當天 vol 不跳升, 須等下個 refit 日。**回測與 Live 端皆有此特性**。
+    
+    **物理致盲三方對比實證 (8 變體完整回測)**: 為判斷物理致盲是 bug 還是有益特徵, 測試 Baseline (物理致盲) vs Pure .fix() (每天更新 vol) vs Confirmation Lag (連續 N 天確認, N=2/3/5) vs Output Smoothing (MA11/MA22/EWMA λ=0.94, 依 Moreira-Muir 2017 與 RiskMetrics)。結果:
+    * **Pure .fix() 重蹈 refit=1 覆轍**: MaxDD 從 -64.37% 惡化至 -69.96% (與 test9_v2 的 refit=1 結果數字完全一致), CAGR -1.84pp, Whipsaw 117→164。證實「消除物理致盲 = 過度敏感」。
+    * **所有變體的 2008 MaxDD 全部維持 -64.37%**: 印證 Phase 1 結論——2008 病因是「GARCH quantile 閾值被推高 (desensitization)」而非雜訊, 故 confirmation/smoothing 等雜訊濾波工具完全無效。
+    * **Output Smoothing 全面劣化**: EWMA λ=0.94 的 ΔCAGR=-5.22% (p=0.041, 唯一統計顯著, 且為顯著變差)。本地 3x 槓桿資料重現 Liu/Tang/Zhou (2021, JFE) 的反面結論——平滑使 turnover 暴增、扣成本後無 alpha。
+    * **反過擬合框架判決**: Level 1/2/3 全部 0 個通過; 所有 7 變體 ΔMaxDD ≤ 0 (無一改善)。
+    * **結論: 物理致盲確認為「有益特徵」而非 bug**。其「每 5 天降採樣」是零額外參數的免費濾波器, 優於 confirmation/smoothing。Gemini 主張的 `.fix()`「唯一正解」被實證推翻 (使 MaxDD 退化 5.59pp)。
+    
+    **採取的修正 (僅修確定性 bug, 物理致盲維持原狀)**:
+    * **索引漂移修正**: `calculate_live_risk` 改用 `data.index` 絕對位置判斷 refit (`(abs_pos - 504) % REFIT_STEP == 0`), 與回測端 `(t - 504) % REFIT_STEP` 用同一把尺 (anchor 同為 504)。修正後同一天 refit 狀態鎖死、不再漂移, 且 Live 與回測完全對齊。回測端 `t` 本為絕對索引、無漂移, 不需修改。
+    * **anchor 防護**: 新增 `check_data_anchor()` 偵測 `data.index` 起點漂移 (預期 EXPECTED_DATA_START=2005-03-11, 容忍 7 天)。若 yfinance 修訂歷史使起點偏移, 絕對位置會整體錯位, 此防護在儀表板示警。純監控, 不改變計算邏輯。
+    * **物理致盲不動**: 經三方對比實證確認為有益特徵, 維持 refit=5 的 Stale Forecast 行為, 確保 Live 與回測在數學上一致。
     
     **遺留限制**：
     * 2024-04 後仍不在 WFA OOS 範圍內，需透過實盤監控
